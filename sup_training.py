@@ -16,9 +16,8 @@ from sklearn.model_selection import train_test_split # 用于从训练集中划�
 from peft import get_peft_model, LoraConfig
 
 
-# 从 cl_training.py 导入必要的类
-# 假设 cl_training.py 与此脚本在同一目录下
-from cl_training_modelscope import ContrastiveEncoder, TextCNNModel, TextCNNTokenizer
+# 从解耦后的模块导入必要的类
+from cl_base_model import ContrastiveEncoder, TextCNNModel, TextCNNTokenizer
 
 # --- 1. 数据集和模型定义 ---
 
@@ -433,9 +432,9 @@ if __name__ == '__main__':
     # --- 实验配置 ---
     # 定义所有实验的通用配置
     BASE_CONFIG = {
-        'train_data_path': 'data_process/sup_train_data/trainset.csv',
-        'test_data_path': 'data_process/sup_train_data/testset.csv',
-        'epochs': 50,
+        'train_data_path': 'data/sup_train_data/trainset.csv',
+        'test_data_path': 'data/sup_train_data/testset.csv',
+        'epochs': 1,
         'batch_size': 16,
         # 'lr' is now defined in METHODS_CONFIG
     }
@@ -450,7 +449,7 @@ if __name__ == '__main__':
         # 推荐使用ModelScope原生支持的特征提取模型，但AutoModel也能处理bert-base-chinese
         
         'lora_bert_base_chinese_cl': 'model/google-bert_bert-base-chinese/best_contrastive_model.pth',
-        "Bert_base_chinese_nocl": "google-bert/bert-base-chinese", 
+        # "Bert_base_chinese_nocl": "google-bert/bert-base-chinese", 
         # 'TextCNN_CL_no_pruing':'model/my_custom_textcnn_v3_no_pruning_paircl/best_contrastive_model.pth'
     }
 
@@ -461,8 +460,8 @@ if __name__ == '__main__':
     ]
     
     # 定义数据比例和随机种子
-    DATA_FRACTIONS = [1, 0.5, 0.2, 0.1, 0.05]
-    SEEDS = [42, 123, 456, 789, 101, 20, 30, 40, 50, 60]  # 增加更多种子以提高结果的稳定性
+    DATA_FRACTIONS = [1]    #, 0.5, 0.2, 0.1, 0.05
+    SEEDS = [42]  # , 123, 456, 789, 101, 20, 30, 40, 50, 60
 
     # --- 实验执行 ---
     all_results = []
@@ -535,10 +534,10 @@ if __name__ == '__main__':
             all_results.append(results_for_method)
 
             # --- 保存结果 ---
-            output_dir = "result"
+            output_dir = "sup_result"
             os.makedirs(output_dir, exist_ok=True)
             
- # 为当前模型和方法的结果创建一个单独的文件，文件名包含冻结状态和训练参数
+            # 为当前模型和方法的结果创建一个单独的文件，文件名包含冻结状态和训练参数
             result_filename = (
                 f"{model_name}_{method_name}_freeze_{method_config['freeze_encoder']}"
                 f"_epoch{BASE_CONFIG['epochs']}_bs{BASE_CONFIG['batch_size']}_lr{method_config['lr']}_results.json"

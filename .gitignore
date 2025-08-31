@@ -1,2 +1,5 @@
 data/
 model/
+cl_dataset/
+sup_result/
+__pycache__/
