@@ -102,7 +102,13 @@ class DynamicContrastiveTrainer:
                  min_subtree_size_ds1: int = 2,
                  max_samples_per_post_ds1: Optional[int] = None,
                  min_subtree_size_ds2: int = 4,
-                 max_samples_per_subtree_ds2: Optional[int] = None):
+                 max_samples_per_subtree_ds2: Optional[int] = None,
+                 # --- 新增正样本对策略参数 ---
+                 positive_pair_strategy: str = 'comment_reply',
+                 simcse_temperature: float = 0.05,
+                 simcse_dropout_rate: float = 0.1,
+                 simcse_remove_duplicates: bool = True,  # 新增：是否去重
+                 hybrid_ratio: float = 0.5):
 
         self.post_storage = post_storage
         self.training_model_type = training_model_type.lower()
@@ -138,6 +144,25 @@ class DynamicContrastiveTrainer:
             self.loss_weights = {'dataset1': 1.0, 'dataset2': 1.0}
             self.adaptive_weighting = False
             print("📊 使用独立损失（每个数据集的损失乘以其权重，默认为1.0）")
+
+        # --- 新增：正样本对策略配置 ---
+        self.positive_pair_strategy = positive_pair_strategy.lower()
+        self.simcse_temperature = simcse_temperature
+        self.simcse_dropout_rate = simcse_dropout_rate
+        self.simcse_remove_duplicates = simcse_remove_duplicates  # 新增
+        self.hybrid_ratio = hybrid_ratio
+        
+        # 验证策略参数
+        if self.positive_pair_strategy not in ['comment_reply', 'simcse_dropout', 'hybrid']:
+            raise ValueError(f"不支持的正样本对策略: {positive_pair_strategy}. 可选: 'comment_reply', 'simcse_dropout', 'hybrid'")
+        
+        print(f"🎯 正样本对构造策略: {self.positive_pair_strategy}")
+        if self.positive_pair_strategy == 'simcse_dropout':
+            print(f"   SimCSE温度参数: {self.simcse_temperature}")
+            print(f"   SimCSE dropout率: {self.simcse_dropout_rate}")
+        elif self.positive_pair_strategy == 'hybrid':
+            print(f"   混合比例 (SimCSE:评论回复) = {self.hybrid_ratio}:{1-self.hybrid_ratio}")
+        # -----------------------------------------
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -423,30 +448,159 @@ class DynamicContrastiveTrainer:
             processed_anchors_count = len(current_anchor_texts)
             if processed_anchors_count == 0: return None
 
+            # --- 🎯 根据策略选择正样本对构造方式 ---
+            if self.positive_pair_strategy == 'comment_reply':
+                # 原有的评论-回复策略
+                anchor_emb = self.contrastive_encoder(current_anchor_texts)
+                positive_emb = self.contrastive_encoder(current_positive_texts)
+                
+            elif self.positive_pair_strategy == 'simcse_dropout':
+                # 🎯 改进的SimCSE策略：使用所有可用文本（父评论+子评论）
+                self.contrastive_encoder.train()  # 确保dropout激活
+                
+                # 合并所有有效文本
+                all_available_texts = []
+                
+                # 添加有效的父评论
+                valid_anchors = [text for text in current_anchor_texts if text is not None and text.strip()]
+                all_available_texts.extend(valid_anchors)
+                
+                # 添加有效的子评论
+                valid_positives = [text for text in current_positive_texts if text is not None and text.strip()]
+                all_available_texts.extend(valid_positives)
+                
+                # 可选：去重避免完全相同的文本
+                if self.simcse_remove_duplicates:
+                    all_available_texts = list(dict.fromkeys(all_available_texts))  # 保持顺序的去重
+                
+                if len(all_available_texts) < 2:
+                    print(f"SimCSE策略：可用文本不足 ({len(all_available_texts)}), 跳过此batch")
+                    return None
+                
+                # 使用所有文本构造正样本对
+                anchor_emb = self.contrastive_encoder(all_available_texts)
+                positive_emb = self.contrastive_encoder(all_available_texts)  # 同样文本，不同dropout
+                
+                processed_anchors_count = len(all_available_texts)
+                print(f"SimCSE策略：使用 {len(valid_anchors)} 个父评论 + {len(valid_positives)} 个子评论 = {processed_anchors_count} 个文本")
+                
+            elif self.positive_pair_strategy == 'hybrid':
+                # 混合策略：部分使用SimCSE（充分利用数据），部分使用评论回复
+                original_count = len(current_anchor_texts)
+                split_point = int(original_count * self.hybrid_ratio)
+                
+                # SimCSE部分：使用部分父子评论的所有文本
+                simcse_anchor_texts = current_anchor_texts[:split_point]
+                simcse_positive_texts = current_positive_texts[:split_point]
+                
+                simcse_all_texts = []
+                simcse_all_texts.extend([t for t in simcse_anchor_texts if t is not None and t.strip()])
+                simcse_all_texts.extend([t for t in simcse_positive_texts if t is not None and t.strip()])
+                
+                # 去重（如果启用）
+                if self.simcse_remove_duplicates:
+                    simcse_all_texts = list(dict.fromkeys(simcse_all_texts))
+                
+                simcse_anchor_emb = None
+                simcse_positive_emb = None
+                if simcse_all_texts:
+                    self.contrastive_encoder.train()
+                    simcse_anchor_emb = self.contrastive_encoder(simcse_all_texts)
+                    simcse_positive_emb = self.contrastive_encoder(simcse_all_texts)
+                    print(f"混合策略-SimCSE部分：使用 {len(simcse_all_texts)} 个文本")
+                
+                # 评论回复部分
+                reply_anchor_texts = current_anchor_texts[split_point:]
+                reply_positive_texts = current_positive_texts[split_point:]
+                reply_anchor_emb = None
+                reply_positive_emb = None
+                if reply_anchor_texts and reply_positive_texts:
+                    reply_anchor_emb = self.contrastive_encoder(reply_anchor_texts)
+                    reply_positive_emb = self.contrastive_encoder(reply_positive_texts)
+                    print(f"混合策略-评论回复部分：使用 {len(reply_anchor_texts)} 对")
+                
+                # 合并嵌入
+                anchor_emb_parts = [emb for emb in [simcse_anchor_emb, reply_anchor_emb] if emb is not None]
+                positive_emb_parts = [emb for emb in [simcse_positive_emb, reply_positive_emb] if emb is not None]
+                
+                if anchor_emb_parts and positive_emb_parts:
+                    anchor_emb = torch.cat(anchor_emb_parts, dim=0)
+                    positive_emb = torch.cat(positive_emb_parts, dim=0)
+                    processed_anchors_count = anchor_emb.shape[0]
+                    print(f"混合策略：总计使用 {processed_anchors_count} 个样本")
+                else:
+                    return None
 
-            anchor_emb = self.contrastive_encoder(current_anchor_texts)
-            positive_emb = self.contrastive_encoder(current_positive_texts)
-
+            # 处理负样本（根据策略调整）
             neg_emb_reshaped = None
             if self.infonce_mode != 'in_batch' and num_negatives_per_anchor > 0 and negative_texts_flat:
-                # 从扁平列表中提取与 valid_indices 对应的负样本
-                current_negative_texts_for_batch = []
-                for original_batch_idx in valid_indices:
-                    start_idx_flat = original_batch_idx * num_negatives_per_anchor
-                    end_idx_flat = start_idx_flat + num_negatives_per_anchor
-                    current_negative_texts_for_batch.extend(negative_texts_flat[start_idx_flat:end_idx_flat])
+                if self.positive_pair_strategy == 'simcse_dropout':
+                    # 对于SimCSE，需要为每个文本生成负样本
+                    # 方案：重复使用原始负样本来匹配新的样本数量
+                    total_needed_negatives = processed_anchors_count * num_negatives_per_anchor
+                    
+                    extended_negative_texts = []
+                    original_neg_count = len(negative_texts_flat)
+                    if original_neg_count > 0:
+                        for i in range(total_needed_negatives):
+                            extended_negative_texts.append(negative_texts_flat[i % original_neg_count])
+                        
+                        neg_emb_flat = self.contrastive_encoder(extended_negative_texts)
+                        if neg_emb_flat.nelement() > 0:
+                            try:
+                                neg_emb_reshaped = neg_emb_flat.view(processed_anchors_count, num_negatives_per_anchor, -1)
+                            except RuntimeError as e:
+                                print(f"SimCSE Reshape error: {e}")
+                                return None
+                        
+                elif self.positive_pair_strategy == 'hybrid':
+                    # 对于混合策略，同样需要扩展负样本
+                    total_needed_negatives = processed_anchors_count * num_negatives_per_anchor
+                    
+                    extended_negative_texts = []
+                    original_neg_count = len(negative_texts_flat)
+                    if original_neg_count > 0:
+                        for i in range(total_needed_negatives):
+                            extended_negative_texts.append(negative_texts_flat[i % original_neg_count])
+                        
+                        neg_emb_flat = self.contrastive_encoder(extended_negative_texts)
+                        if neg_emb_flat.nelement() > 0:
+                            try:
+                                neg_emb_reshaped = neg_emb_flat.view(processed_anchors_count, num_negatives_per_anchor, -1)
+                            except RuntimeError as e:
+                                print(f"混合策略 Reshape error: {e}")
+                                return None
+                        
+                else:
+                    # 原有的评论回复策略：保持原有逻辑
+                    current_negative_texts_for_batch = []
+                    for original_batch_idx in valid_indices:
+                        start_idx_flat = original_batch_idx * num_negatives_per_anchor
+                        end_idx_flat = start_idx_flat + num_negatives_per_anchor
+                        current_negative_texts_for_batch.extend(negative_texts_flat[start_idx_flat:end_idx_flat])
 
-                if current_negative_texts_for_batch:
-                    neg_emb_flat = self.contrastive_encoder(current_negative_texts_for_batch)
-                    if neg_emb_flat.nelement() > 0:
-                        try:
-                            neg_emb_reshaped = neg_emb_flat.view(processed_anchors_count, num_negatives_per_anchor, -1)
-                        except RuntimeError as e:
-                            print(f"DS1 Reshape error: {e}. Anchors: {processed_anchors_count}, Neg per anchor: {num_negatives_per_anchor}, Flat neg shape: {neg_emb_flat.shape}")
-                            return None # or handle differently
+                    if current_negative_texts_for_batch:
+                        neg_emb_flat = self.contrastive_encoder(current_negative_texts_for_batch)
+                        if neg_emb_flat.nelement() > 0:
+                            try:
+                                neg_emb_reshaped = neg_emb_flat.view(processed_anchors_count, num_negatives_per_anchor, -1)
+                            except RuntimeError as e:
+                                print(f"DS1 Reshape error: {e}")
+                                return None
 
             if anchor_emb.nelement() > 0 and positive_emb.nelement() > 0:
-                loss = loss_fn(anchor_emb, positive_emb, neg_emb_reshaped if neg_emb_reshaped is not None and neg_emb_reshaped.nelement() > 0 else None)
+                # 对于SimCSE策略，可以使用不同的温度参数
+                current_loss_fn = loss_fn
+                if self.positive_pair_strategy == 'simcse_dropout':
+                    # 导入ContrastiveLoss
+                    from cl_loss import ContrastiveLoss
+                    current_loss_fn = ContrastiveLoss(
+                        temperature=self.simcse_temperature, 
+                        loss_type='infonce', 
+                        infonce_mode=self.infonce_mode
+                    )
+                
+                loss = current_loss_fn(anchor_emb, positive_emb, neg_emb_reshaped if neg_emb_reshaped is not None and neg_emb_reshaped.nelement() > 0 else None)
 
         elif dataset_name == 'dataset2':
             valid_indices = [i for i, lst in enumerate(positive_content_lists_ds2) if lst is not None and any(s and s.strip() for s in lst)]
@@ -703,6 +857,13 @@ class DynamicContrastiveTrainer:
             'use_peft': self.use_peft,
             'peft_config': self.peft_config,
             # --------------------
+            # --- 新增正样本对策略状态 ---
+            'positive_pair_strategy': self.positive_pair_strategy,
+            'simcse_temperature': self.simcse_temperature,
+            'simcse_dropout_rate': self.simcse_dropout_rate,
+            'simcse_remove_duplicates': self.simcse_remove_duplicates,  # 新增
+            'hybrid_ratio': self.hybrid_ratio,
+            # --------------------------------
             'min_subtree_size_ds1': self.min_subtree_size_ds1,
             'max_samples_per_post_ds1': self.max_samples_per_post_ds1,
             'min_subtree_size_ds2': self.min_subtree_size_ds2,
@@ -712,9 +873,21 @@ class DynamicContrastiveTrainer:
             state['textcnn_config'] = self.textcnn_config
             state['vocab'] = self.vocab
 
-        # 根据模型标识符创建保存目录
-        sanitized_model_name = self.training_model_identifier_or_path.replace('/', '_')
-        save_dir = os.path.join("model", sanitized_model_name)
+        # 🎯 改进的保存路径：包含模型名、策略、相似度阈值
+        # 1. 处理模型名称
+        model_name = self.training_model_identifier_or_path.replace('/', '_').replace('-', '_')
+        
+        # 2. 策略名称
+        strategy_name = self.positive_pair_strategy
+        if self.positive_pair_strategy == 'hybrid':
+            strategy_name = f"hybrid_ratio{self.hybrid_ratio}"
+        
+        # 3. 相似度阈值
+        similarity_str = str(self.similarity_threshold).replace('.', 'p')  # 0.95 -> 0p95
+        
+        # 4. 组合文件夹名
+        experiment_folder_name = f"{model_name}_{strategy_name}_sim{similarity_str}"
+        save_dir = os.path.join("model", experiment_folder_name)
         os.makedirs(save_dir, exist_ok=True)
 
         # 生成损失图的PNG字节
@@ -733,6 +906,13 @@ class DynamicContrastiveTrainer:
         filepath = os.path.join(save_dir, "best_contrastive_model.pth")
         torch.save(state, filepath)
         print(f"✅ 最优模型已更新并保存至: {filepath}")
+        print(f"📁 实验文件夹: {experiment_folder_name}")
+
+        # 可选：保存基础模型到独立目录
+        base_model_dir = os.path.join(save_dir, f"trained_{self.training_model_type}_embedding_model")
+        os.makedirs(base_model_dir, exist_ok=True)
+        self.contrastive_encoder.save_base_model(base_model_dir)
+        print(f"🔧 基础模型已保存至: {base_model_dir}")
 
 
     def plot_training_progress(self, save_plot=False, show_plot=True, return_bytes=False):
@@ -929,117 +1109,7 @@ def fine_tune_contrastive_model(
         if patience_counter >= scheduler_patience:
             print("🛑 早停触发，停止训练")
 
-def main_training_pipeline():
-    print("🚀 开始训练流程...")
-    # 1. 准备数据
-    try:
-        comment_df = pd.read_csv('data/cl_data/train_comments_filtered.csv', encoding='utf-8')
-        post_df = pd.read_csv('data/cl_data/train_posts_filtered.csv', encoding='utf-8')
-    except FileNotFoundError:
-        print("错误: comments_data.csv 或 contents_data.csv 未找到。请确保数据文件存在。")
-        return      
-    
 
-    # 确保 note_id 和 comment_id 是字符串类型，以避免后续问题
-    comment_df['note_id'] = comment_df['note_id'].astype(str)
-    comment_df['comment_id'] = comment_df['comment_id'].astype(str)
-    comment_df['parent_comment_id'] = comment_df['parent_comment_id'].astype(str)
-    post_df['note_id'] = post_df['note_id'].astype(str)
-
-
-    storage = PostStorage()
-    # 确保帖子内容是字符串，如果 title 不存在，尝试 content，如果都为空，则为空字符串
-    for _, row in post_df.iterrows():
-        post_content = str(row.get('title', '')) or str(row.get('content', '')) # 保证是字符串
-        storage.add_post(post_id=str(row['note_id']), post_content=post_content)
-
-    for _, row in comment_df.iterrows():
-        post_id_str = str(row['note_id'])
-        comment_id_str = str(row['comment_id'])
-        content_str = str(row.get('content', '')) # 确保内容是字符串
-        parent_id_str = str(row['parent_comment_id']) if str(row['parent_comment_id']) != '0' else post_id_str
-        
-        try:
-            storage.add_comment_to_post(post_id_str, comment_id_str, content_str, parent_id_str)
-        except Exception as e:
-            print(f"插入评论失败: {e}, 帖子ID: {post_id_str}, 评论ID: {comment_id_str}")
-
-    # 2. 选择训练模型类型并配置训练器
-    common_trainer_params = {
-        'post_storage': storage,
-        'pruning_model_path': "google-bert/bert-base-chinese", # 
-        'similarity_threshold': 0.95, # 调整阈值
-        'num_negatives': 8,      # 增加负样本数量
-        'batch_size': 8,        # 调整批量大小
-        'pruning_inference_batch_size': 16, # <--- 为剪枝模型推断设置一个合理的批大小
-        'base_lr': 5e-6,         # 调整学习率
-        'projection_lr': 5e-5,
-        'use_weighted_loss': True,
-        'loss_weights': {'dataset1': 1, 'dataset2': 0}, # 调整权重
-        'adaptive_weighting': False, # 启用自适应权重
-        'infonce_mode': 'bidirectional', # 双向对比
-        'projection_head_config': {'hidden_dim': 768, 'output_dim': 384, 'dropout_rate': 0.15}, # 调整投影头
-        'min_subtree_size_ds1': 2, 'max_samples_per_post_ds1': None,
-        'min_subtree_size_ds2': 100000, 'max_samples_per_subtree_ds2': None,
-
-        # --- 新增PEFT配置 ---
-        'use_peft': True,  # 设置为 True 来启用 LoRA
-        'peft_config': {
-            'r': 8,              # LoRA的秩，越小参数越少，常用8, 16, 32
-            'lora_alpha': 16,    # LoRA的缩放因子，通常是r的两倍
-            'target_modules': ["query", "key", "value"], # 对注意力的Q,K,V应用
-            'lora_dropout': 0.1, # LoRA层的dropout率
-            'bias': "none",      # "none", "all", "lora_only"
-    }}
-
-    # 🎯 选项 1: ModelScope 模型
-    print("\n--- 配置 ModelScope 模型训练 ---")
-    trainer = DynamicContrastiveTrainer(
-        training_model_type='modelscope',
-        # 使用另一个ModelScope模型作为训练目标
-        training_model_identifier_or_path="google-bert/bert-base-chinese",
-        **common_trainer_params
-    )
-
-    # # 🎯 选项 2: 自定义 TextCNN
-    # print("\n--- 配置 TextCNN 训练 ---")
-    # textcnn_specific_config = {
-    #     'embedding_dim': 300,       
-    #     'num_filters': 128,         
-    #     'filter_sizes': [2, 3, 4],  
-    #     'model_dropout_rate': 0.1,  
-    #     'max_seq_length': 200,      # TextCNN分词器的最大序列长度
-    #     'textcnn_output_dim': 768,  # TextCNN输出维度 (与投影头输出匹配或作为其输入)
-    #     'min_vocab_freq': 1         # 词汇表最小词频
-    # }
-    
-    # 确保 TextCNN 的输出维度与投影头的输入维度匹配
-    # common_trainer_params['projection_head_config']['hidden_dim'] 可以基于 textcnn_output_dim
-    # 或者 textcnn_output_dim 直接作为投影头的输入
-    # 这里假设 textcnn_output_dim 是投影头的输入，所以 base_dim 会是 textcnn_output_dim
-
-    # trainer = DynamicContrastiveTrainer(
-    #     training_model_type='textcnn',
-    #     training_model_identifier_or_path="model/my_custom_textcnn_v4_no_pruning_paircl", # 自定义模型标识符
-    #     textcnn_config=textcnn_specific_config,
-    #     **common_trainer_params
-    # )
-    
-    # 3. 开始训练
-    print("\n--- 开始训练 ---")
-    trainer.train(
-        num_epochs=1, # 为了快速测试，减少了epoch，原为100
-        rebuild_frequency=2,  # 为了快速测试，减少了频率，原为200
-        scheduler_patience=7, # 原为2
-        min_improvement=1e-5
-    )
-    
-    print("🎉 训练流程完成!")
-    print(f"💾 最佳模型和训练状态已保存。训练后的基础模型部分位于 'trained_{trainer.training_model_type}_embedding_model' 目录中。")
-
-
-if __name__ == "__main__":
-    main_training_pipeline()
 
 
 
