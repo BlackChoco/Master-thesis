@@ -6,11 +6,12 @@ import numpy as np
 import os
 import json
 import random
+import itertools
 from tqdm import tqdm
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 # --- 关键修改: 导入 AutoModel 和 AutoTokenizer ---
-from modelscope import AutoModel, AutoTokenizer 
+from modelscope import AutoModel, AutoTokenizer
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
 from sklearn.model_selection import train_test_split # 用于从训练集中划分验证集
 from peft import get_peft_model, LoraConfig
@@ -69,10 +70,10 @@ class SupervisedModel(nn.Module):
     """
     包装预训练的编码器和一个分类头。
     """
-    def __init__(self, base_encoder: nn.Module, num_labels: int, classifier_type: str = 'linear'):
+    def __init__(self, base_encoder: nn.Module, num_labels: int, classifier_type: str = 'linear', mlp_layers: int = 2):
         super().__init__()
         self.base_encoder = base_encoder
-        
+
         # 从基础编码器获取隐藏层维度
         if hasattr(base_encoder, 'base_dim'): # 适用于我们自定义的TextCNNModel
             hidden_size = base_encoder.base_dim
@@ -84,7 +85,7 @@ class SupervisedModel(nn.Module):
                 # 创建一个虚拟输入来推断维度
                 dummy_input = {'input_ids': torch.randint(0, 100, (1, 10)), 'attention_mask': torch.ones(1, 10)}
                 dummy_output = base_encoder(**dummy_input)
-                
+
                 # 调试：打印输出的所有键
                 print(f"调试: 模型输出键: {dummy_output.keys()}")
 
@@ -104,13 +105,25 @@ class SupervisedModel(nn.Module):
         if classifier_type == 'linear':
             self.classifier = nn.Linear(hidden_size, num_labels)
         elif classifier_type == 'mlp':
-            self.classifier = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size // 2),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_size // 2, num_labels)
-                
-            )
+            # 动态构建MLP分类器
+            layers = []
+            current_dim = hidden_size
+
+            # 添加隐藏层
+            for i in range(mlp_layers - 1):
+                next_dim = current_dim // 2
+                layers.extend([
+                    nn.Linear(current_dim, next_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ])
+                current_dim = next_dim
+
+            # 添加输出层
+            layers.append(nn.Linear(current_dim, num_labels))
+
+            self.classifier = nn.Sequential(*layers)
+            print(f"MLP分类器结构: {mlp_layers}层，维度变化: {hidden_size} -> ... -> {num_labels}")
         else:
             raise ValueError(f"不支持的分类器类型: {classifier_type}。请选择 'linear' 或 'mlp'。")
 
@@ -323,90 +336,183 @@ def evaluate_model(model, data_loader, loss_fn, device, id_to_label: dict):
         "per_class_metrics": per_class_metrics
     }
 
-# --- 4. 主实验流程 ---
+# --- 4. 超参数搜索配置 ---
 
-def run_experiment(config):
-    """运行单次完整的实验（给定配置和种子）。"""
-    
+# 统一的实验配置字典
+CONFIG = {
+    # 实验元信息
+    'experiment_meta': {
+        'description': 'baseline_comparison',  # 实验描述标识符
+        'experiment_name': 'Baseline对比实验',   # 实验的中文名称
+        'purpose': '对比LoRA微调后的BERT与原始BERT在不同数据量下的性能表现',  # 实验目的
+        'notes': '使用linear probe和MLP分类器，测试5个不同数据比例',  # 实验备注
+    },
+
+    # 数据配置
+    'data': {
+        'train_data_path': 'data/sup_train_data/trainset.csv',
+        'test_data_path': 'data/sup_train_data/testset.csv',
+        'validation_split': 0.2,  # 验证集比例
+        'excluded_labels': [5],   # 要过滤的标签
+    },
+
+    # 模型配置
+    'models': {
+        'lora_bert_base_chinese_cl': 'model/google-bert_bert-base-chinese/best_contrastive_model.pth',
+        # 'TextCNN_CL_bert': 'model/my_custom_textcnn_v3_bert_pruning_paircl/best_contrastive_model.pth',
+        'Bert_base_chinese_nocl': 'google-bert/bert-base-chinese',
+    },
+
+    # 超参数搜索空间
+    'hyperparameters': {
+        'epochs': [50],                    # 训练轮数
+        'batch_size': [32],              # 批次大小
+        'learning_rate': [1e-3], # 学习率
+        'data_fractions': [1.0, 0.5, 0.2, 0.1, 0.05],  # 数据使用比例
+        'seeds': [42, 123, 456, 789, 101],             # 随机种子
+        'classifier_types': ['linear'], # 分类器类型
+        'mlp_layers': [1, 2, 3],          # MLP层数 (仅在classifier_type='mlp'时生效)
+        'freeze_encoder': [True],     # 是否冻结编码器
+    },
+
+    # 实验控制
+    'experiment': {
+        'base_output_dir': 'sup_result_hyperparams',  # 基础输出目录
+        'save_individual_results': True,
+        'aggregate_results': True,
+        'save_experiment_info': True,  # 保存实验信息
+    }
+}
+
+def generate_hyperparameter_combinations(config):
+    """生成所有超参数组合"""
+    hyperparams = config['hyperparameters']
+
+    # 创建超参数组合
+    combinations = []
+    for (model_name, checkpoint_path), epochs, batch_size, lr, fraction, seed, classifier_type, mlp_layers, freeze in itertools.product(
+        config['models'].items(),
+        hyperparams['epochs'],
+        hyperparams['batch_size'],
+        hyperparams['learning_rate'],
+        hyperparams['data_fractions'],
+        hyperparams['seeds'],
+        hyperparams['classifier_types'],
+        hyperparams['mlp_layers'],
+        hyperparams['freeze_encoder']
+    ):
+        # 只有当classifier_type='mlp'时，mlp_layers参数才有意义
+        # 当classifier_type='linear'时，跳过mlp_layers > 1的组合
+        if classifier_type == 'linear' and mlp_layers > 1:
+            continue
+
+        combinations.append({
+            'model_name': model_name,
+            'checkpoint_path': checkpoint_path,
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'learning_rate': lr,
+            'data_fraction': fraction,
+            'seed': seed,
+            'classifier_type': classifier_type,
+            'mlp_layers': mlp_layers,
+            'freeze_encoder': freeze,
+        })
+
+    return combinations
+
+def run_single_experiment(config, hyperparams):
+    """运行单次实验"""
+
     # 设置随机种子
-    set_seed(config['seed'])
-    print(f"\n--- 运行实验: 模型={config['model_name']}, 方法={config['method']}, "
-          f"数据比例={config['data_fraction']*100}%, 种子={config['seed']} ---")
+    set_seed(hyperparams['seed'])
+    print(f"\n--- 实验配置 ---")
+    print(f"模型: {hyperparams['model_name']}")
+    print(f"分类器: {hyperparams['classifier_type']}")
+    if hyperparams['classifier_type'] == 'mlp':
+        print(f"MLP层数: {hyperparams['mlp_layers']}")
+    print(f"冻结编码器: {hyperparams['freeze_encoder']}")
+    print(f"数据比例: {hyperparams['data_fraction']*100}%")
+    print(f"学习率: {hyperparams['learning_rate']}")
+    print(f"批次大小: {hyperparams['batch_size']}")
+    print(f"训练轮数: {hyperparams['epochs']}")
+    print(f"随机种子: {hyperparams['seed']}")
 
     # 加载数据
-    df_train_full, df_test = load_data(config['train_data_path'], config['test_data_path'])
-    if df_train_full is None: 
+    df_train_full, df_test = load_data(config['data']['train_data_path'], config['data']['test_data_path'])
+    if df_train_full is None:
         return None
 
-    # 过滤掉 label 为 5 的样本（训练集和测试集都要过滤）
-    df_train_full = df_train_full[df_train_full['label'] != 5].reset_index(drop=True)
-    df_test = df_test[df_test['label'] != 5].reset_index(drop=True)
+    # 过滤标签
+    for label in config['data']['excluded_labels']:
+        df_train_full = df_train_full[df_train_full['label'] != label].reset_index(drop=True)
+        df_test = df_test[df_test['label'] != label].reset_index(drop=True)
 
-    # 1. 先从完整训练数据中划分出固定的验证集
-    from sklearn.model_selection import train_test_split
+    # 划分验证集
     df_train_prelim, df_val = train_test_split(
         df_train_full,
-        test_size=0.1, # 验证集占完整训练集的10%
-        random_state=config['seed'],
+        test_size=config['data']['validation_split'],
+        random_state=hyperparams['seed'],
         stratify=df_train_full['label']
     )
 
-    # 2. 再从划分后的训练集中进行采样（如有需要）
-    if config['data_fraction'] < 1.0:
-        # 分层采样
+    # 数据采样
+    if hyperparams['data_fraction'] < 1.0:
         df_train = df_train_prelim.groupby('label', group_keys=False).apply(
-            lambda x: x.sample(frac=config['data_fraction'], random_state=config['seed'])
+            lambda x: x.sample(frac=hyperparams['data_fraction'], random_state=hyperparams['seed'])
         ).reset_index(drop=True)
     else:
-        df_train = df_train_prelim.reset_index(drop=True) # 当使用全部数据时，也重置索引
+        df_train = df_train_prelim.reset_index(drop=True)
 
-    # 重新生成标签映射（只包含剩下的标签）
+    # 生成标签映射
     unique_labels = sorted(df_train_full['label'].unique())
     label_to_id = {label: i for i, label in enumerate(unique_labels)}
     id_to_label = {i: label for label, i in label_to_id.items()}
     num_labels = len(unique_labels)
 
-    # 加载预训练的编码器和分词器
-    base_encoder, tokenizer, _ = load_pretrained_encoder(config['checkpoint_path'])
-    if base_encoder is None: return None
-    
+    # 加载预训练编码器
+    base_encoder, tokenizer, _ = load_pretrained_encoder(hyperparams['checkpoint_path'])
+    if base_encoder is None:
+        return None
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 创建数据集和数据加载器
+
+    # 创建数据集
     train_dataset = SupervisedTextDataset(df_train['content'].tolist(), df_train['label'].tolist(), tokenizer, label_to_id)
     val_dataset = SupervisedTextDataset(df_val['content'].tolist(), df_val['label'].tolist(), tokenizer, label_to_id)
     test_dataset = SupervisedTextDataset(df_test['content'].tolist(), df_test['label'].tolist(), tokenizer, label_to_id)
 
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
+    train_loader = DataLoader(train_dataset, batch_size=hyperparams['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=hyperparams['batch_size'])
+    test_loader = DataLoader(test_dataset, batch_size=hyperparams['batch_size'])
 
     # 构建监督模型
     model = SupervisedModel(
         base_encoder=base_encoder,
         num_labels=num_labels,
-        classifier_type='mlp' if config['method'] == 'fine_tune' else 'linear'
+        classifier_type=hyperparams['classifier_type'],
+        mlp_layers=hyperparams['mlp_layers'] if hyperparams['classifier_type'] == 'mlp' else 1
     ).to(device)
 
-    # 根据配置冻结或解冻编码器
-    if config['freeze_encoder']:
+    # 设置优化器
+    if hyperparams['freeze_encoder']:
         model.freeze_encoder()
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config['lr'])
-    else: # fine_tune
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=hyperparams['learning_rate'])
+    else:
         model.unfreeze_encoder()
-        optimizer = AdamW(model.parameters(), lr=config['lr'])
+        optimizer = AdamW(model.parameters(), lr=hyperparams['learning_rate'])
 
     # 准备训练
     loss_fn = nn.CrossEntropyLoss()
-    total_steps = len(train_loader) * config['epochs']
+    total_steps = len(train_loader) * hyperparams['epochs']
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
     best_val_f1 = -1
     best_model_state = None
 
     # 训练循环
-    for epoch in range(config['epochs']):
-        print(f"  Epoch {epoch + 1}/{config['epochs']}")
+    for epoch in range(hyperparams['epochs']):
+        print(f"  Epoch {epoch + 1}/{hyperparams['epochs']}")
         train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device, scheduler)
         val_metrics = evaluate_model(model, val_loader, loss_fn, device, id_to_label)
         print(f"  训练损失: {train_loss:.4f} | 验证损失: {val_metrics['loss']:.4f} | 验证F1: {val_metrics['f1_score']:.4f}")
@@ -416,137 +522,236 @@ def run_experiment(config):
             best_model_state = model.state_dict()
             print(f"  🎉 新的最佳验证F1分数: {best_val_f1:.4f}")
 
-    # 使用最佳模型在测试集上评估
+    # 测试集评估
     if best_model_state:
         model.load_state_dict(best_model_state)
     print("🧪 使用最佳模型在测试集上进行最终评估...")
     test_metrics = evaluate_model(model, test_loader, loss_fn, device, id_to_label)
     print(f"  测试集结果 -> 损失: {test_metrics['loss']:.4f}, 准确率: {test_metrics['accuracy']:.4f}, F1分数: {test_metrics['f1_score']:.4f}")
-    
-    return test_metrics
+
+    # 添加超参数信息到结果中
+    result = {
+        'hyperparameters': hyperparams,
+        'metrics': test_metrics,
+        'best_val_f1': best_val_f1
+    }
+
+    return result
+
+def save_experiment_results(results, config):
+    """保存实验结果"""
+    # 创建实验特定的输出目录
+    experiment_id = config['experiment_meta']['description']
+    output_dir = os.path.join(config['experiment']['base_output_dir'], experiment_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 保存实验信息
+    if config['experiment']['save_experiment_info']:
+        experiment_info = {
+            'experiment_meta': config['experiment_meta'],
+            'data_config': config['data'],
+            'models': config['models'],
+            'hyperparameters': config['hyperparameters'],
+            'total_experiments': len(results),
+            'successful_experiments': sum(1 for r in results if r is not None),
+            'timestamp': pd.Timestamp.now().isoformat()
+        }
+
+        info_filepath = os.path.join(output_dir, 'experiment_info.json')
+        with open(info_filepath, 'w', encoding='utf-8') as f:
+            json.dump(experiment_info, f, ensure_ascii=False, indent=4)
+        print(f"📋 实验信息已保存到: {info_filepath}")
+
+    if config['experiment']['save_individual_results']:
+        # 保存每个实验的详细结果
+        for i, result in enumerate(results):
+            if result is None:
+                continue
+            hyperparams = result['hyperparameters']
+            filename = (
+                f"{hyperparams['model_name']}_{hyperparams['classifier_type']}"
+            )
+            if hyperparams['classifier_type'] == 'mlp':
+                filename += f"_{hyperparams['mlp_layers']}layers"
+            filename += (
+                f"_freeze{hyperparams['freeze_encoder']}_"
+                f"ep{hyperparams['epochs']}_bs{hyperparams['batch_size']}_"
+                f"lr{hyperparams['learning_rate']}_"
+                f"frac{int(hyperparams['data_fraction']*100)}_"
+                f"seed{hyperparams['seed']}.json"
+            )
+            filepath = os.path.join(output_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=4)
+
+    if config['experiment']['aggregate_results']:
+        # 聚合结果分析
+        aggregate_results = {}
+        for result in results:
+            if result is None:
+                continue
+
+            hyperparams = result['hyperparameters']
+            metrics = result['metrics']
+
+            # 创建配置键
+            config_key = (
+                hyperparams['model_name'],
+                hyperparams['classifier_type'],
+                hyperparams['mlp_layers'] if hyperparams['classifier_type'] == 'mlp' else 1,
+                hyperparams['freeze_encoder'],
+                hyperparams['epochs'],
+                hyperparams['batch_size'],
+                hyperparams['learning_rate'],
+                hyperparams['data_fraction']
+            )
+
+            if config_key not in aggregate_results:
+                aggregate_results[config_key] = []
+
+            aggregate_results[config_key].append({
+                'seed': hyperparams['seed'],
+                'accuracy': metrics['accuracy'],
+                'f1_score': metrics['f1_score'],
+                'precision': metrics['precision'],
+                'recall': metrics['recall']
+            })
+
+        # 计算统计信息
+        summary_results = {
+            'experiment_meta': config['experiment_meta'],  # 添加实验元信息
+            'results': {}
+        }
+
+        for config_key, runs in aggregate_results.items():
+            if len(runs) > 0:
+                df_runs = pd.DataFrame(runs)
+                summary_results['results'][str(config_key)] = {
+                    'config': {
+                        'model_name': config_key[0],
+                        'classifier_type': config_key[1],
+                        'mlp_layers': config_key[2],
+                        'freeze_encoder': config_key[3],
+                        'epochs': config_key[4],
+                        'batch_size': config_key[5],
+                        'learning_rate': config_key[6],
+                        'data_fraction': config_key[7]
+                    },
+                    'mean_metrics': df_runs.mean().to_dict(),
+                    'std_metrics': df_runs.std().to_dict(),
+                    'num_runs': len(runs),
+                    'all_runs': runs
+                }
+
+        # 保存聚合结果
+        summary_filepath = os.path.join(output_dir, 'hyperparameter_search_summary.json')
+        with open(summary_filepath, 'w', encoding='utf-8') as f:
+            json.dump(summary_results, f, ensure_ascii=False, indent=4)
+
+        print(f"\n✅ 聚合结果已保存到: {summary_filepath}")
+
+    return output_dir
 
 
-# --- 5. 主函数 ---
+# --- 6. 主函数 ---
 
 if __name__ == '__main__':
-    # --- 实验配置 ---
-    # 定义所有实验的通用配置
-    BASE_CONFIG = {
-        'train_data_path': 'data/sup_train_data/trainset.csv',
-        'test_data_path': 'data/sup_train_data/testset.csv',
-        'epochs': 1,
-        'batch_size': 16,
-        # 'lr' is now defined in METHODS_CONFIG
-    }
-    
-    # 定义要运行的对比学习模型
-    # key: 一个描述性名称, value: checkpoint文件的路径或ModelScope模型标识符
-    EXPERIMENT_MODELS = {
-        # "jina_embed_none":'jinaai/jina-embeddings-v3',
-        
-        # "TextCNN_CL_bert_random": "model/model_random_init/best_contrastive_model.pth",
-        # 'TextCNN_CL_bert':'model/my_custom_textcnn_v3_bert_pruning_paircl/best_contrastive_model.pth',
-        # 推荐使用ModelScope原生支持的特征提取模型，但AutoModel也能处理bert-base-chinese
-        
-        'lora_bert_base_chinese_cl': 'model/google-bert_bert-base-chinese/best_contrastive_model.pth',
-        # "Bert_base_chinese_nocl": "google-bert/bert-base-chinese", 
-        # 'TextCNN_CL_no_pruing':'model/my_custom_textcnn_v3_no_pruning_paircl/best_contrastive_model.pth'
-    }
+    print("🚀 开始超参数搜索实验...")
+    print(f"📝 实验名称: {CONFIG['experiment_meta']['experiment_name']}")
+    print(f"🎯 实验目的: {CONFIG['experiment_meta']['purpose']}")
+    print(f"📄 实验备注: {CONFIG['experiment_meta']['notes']}")
 
-    # 定义要运行的评估方法配置
-    METHODS_CONFIG = [
-        {'name': 'linear_probe', 'freeze_encoder': True, 'lr': 1e-3},
-        # {'name': 'fine_tune', 'freeze_encoder': False, 'lr': 2e-5}, 
-    ]
-    
-    # 定义数据比例和随机种子
-    DATA_FRACTIONS = [1]    #, 0.5, 0.2, 0.1, 0.05
-    SEEDS = [42]  # , 123, 456, 789, 101, 20, 30, 40, 50, 60
+    # 生成所有超参数组合
+    combinations = generate_hyperparameter_combinations(CONFIG)
+    print(f"📊 总共需要运行 {len(combinations)} 个实验配置")
 
-    # --- 实验执行 ---
+    # 运行所有实验
     all_results = []
+    for i, hyperparams in enumerate(combinations):
+        print(f"\n{'='*80}")
+        print(f"实验进度: {i+1}/{len(combinations)}")
+        print(f"{'='*80}")
 
-    for model_name, checkpoint_path in EXPERIMENT_MODELS.items():
-        for method_config in METHODS_CONFIG:
-            method_name = method_config['name']
-            
-            results_for_method = {
-                "model_name": model_name,
-                "method": method_name,
-                "freeze_encoder": method_config['freeze_encoder'],
-                "epochs": BASE_CONFIG['epochs'],
-                "batch_size": BASE_CONFIG['batch_size'],
-                "learning_rate": method_config['lr'],
-                "results_by_fraction": {}
-            }
+        result = run_single_experiment(CONFIG, hyperparams)
+        all_results.append(result)
 
-            for fraction in DATA_FRACTIONS:
-                
-                fraction_key = f"{int(fraction*100)}%"
-                print(f"\n======================================================================")
-                print(f"开始实验系列: 模型='{model_name}', 方法='{method_name}', 冻结={method_config['freeze_encoder']}, 数据比例='{fraction_key}'")
-                print(f"======================================================================\n")
+        # 可选：每完成几个实验就保存一次中间结果
+        if (i + 1) % 10 == 0:
+            print(f"\n💾 保存中间结果... (已完成 {i+1}/{len(combinations)} 个实验)")
+            experiment_dir = save_experiment_results(all_results, CONFIG)
 
-                run_metrics = []
-                for seed in SEEDS:
-                    config = BASE_CONFIG.copy()
-                    config.update({
-                        "model_name": model_name,
-                        "checkpoint_path": checkpoint_path,
-                        "method": method_name,
-                        "freeze_encoder": method_config['freeze_encoder'],
-                        "data_fraction": fraction,
-                        "seed": seed,
-                        "lr": method_config['lr']
-                    })
-                    
-                    metrics = run_experiment(config)
-                    if metrics:
-                        run_metrics.append(metrics)
-                
-                # 计算均值和方差
-                if run_metrics:
-                    # 扁平化结果以计算统计数据
-                    flattened_metrics_list = []
-                    for m in run_metrics:
-                        flat_m = {}
-                        # 复制顶级指标
-                        for k, v in m.items():
-                            if k != 'per_class_metrics':
-                                flat_m[k] = v
-                        # 扁平化每个类别的指标
-                        if 'per_class_metrics' in m:
-                            for class_name, class_stats in m['per_class_metrics'].items():
-                                for metric_name, value in class_stats.items():
-                                    flat_m[f"{class_name}_{metric_name}"] = value
-                        flattened_metrics_list.append(flat_m)
+    # 保存最终结果
+    print(f"\n💾 保存最终实验结果...")
+    experiment_dir = save_experiment_results(all_results, CONFIG)
 
-                    df_metrics = pd.DataFrame(flattened_metrics_list)
-                    mean_metrics = df_metrics.mean().to_dict()
-                    std_metrics = df_metrics.std().to_dict()
-                    
-                    results_for_method["results_by_fraction"][fraction_key] = {
-                        "mean": mean_metrics,
-                        "std": std_metrics,
-                        "runs": run_metrics # 保存每次运行的原始结构化结果
-                    }
+    print(f"\n🎉 所有超参数搜索实验已完成！")
+    print(f"📁 结果保存在: {experiment_dir}")
+    print(f"📋 实验描述: {CONFIG['experiment_meta']['description']}")
 
-            all_results.append(results_for_method)
+# --- 其他实验配置示例 ---
 
-            # --- 保存结果 ---
-            output_dir = "sup_result"
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 为当前模型和方法的结果创建一个单独的文件，文件名包含冻结状态和训练参数
-            result_filename = (
-                f"{model_name}_{method_name}_freeze_{method_config['freeze_encoder']}"
-                f"_epoch{BASE_CONFIG['epochs']}_bs{BASE_CONFIG['batch_size']}_lr{method_config['lr']}_results.json"
-            )
-            result_filepath = os.path.join(output_dir, result_filename)
-            
-            with open(result_filepath, 'w', encoding='utf-8') as f:
-                json.dump(results_for_method, f, ensure_ascii=False, indent=4)
-            
-            print(f"\n✅ 实验系列结果已保存到: {result_filepath}")
+# 你可以复制以下配置示例，修改experiment_meta部分，进行不同的实验对比
 
-    print("\n\n🎉 所有实验已完成！")
+EXPERIMENT_CONFIGS = {
+    "learning_rate_comparison": {
+        'experiment_meta': {
+            'description': 'learning_rate_comparison',
+            'experiment_name': '学习率对比实验',
+            'purpose': '测试不同学习率对模型性能的影响',
+            'notes': '固定其他参数，对比1e-3, 2e-3, 5e-3三种学习率',
+        },
+        'hyperparameters': {
+            'epochs': [20],
+            'batch_size': [32],
+            'learning_rate': [1e-3, 2e-3, 5e-3],
+            'data_fractions': [1.0],
+            'seeds': [42, 123, 456],
+            'classifier_types': ['linear'],
+            'mlp_layers': [1],  # linear分类器时MLP层数无意义
+            'freeze_encoder': [True],
+        },
+    },
+
+    "data_efficiency": {
+        'experiment_meta': {
+            'description': 'data_efficiency',
+            'experiment_name': '数据效率分析',
+            'purpose': '分析模型在不同数据量下的学习效率',
+            'notes': '固定最优参数，测试数据稀缺场景下的性能衰减',
+        },
+        'hyperparameters': {
+            'epochs': [50],
+            'batch_size': [32],
+            'learning_rate': [1e-3],
+            'data_fractions': [1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.05, 0.01],
+            'seeds': [42, 123, 456, 789, 101],
+            'classifier_types': ['linear', 'mlp'],
+            'mlp_layers': [1, 2, 3],  # 测试不同MLP层数
+            'freeze_encoder': [True],
+        },
+    },
+
+    "architecture_comparison": {
+        'experiment_meta': {
+            'description': 'architecture_comparison',
+            'experiment_name': '架构对比实验',
+            'purpose': '对比Linear Probe和MLP分类器的性能差异',
+            'notes': '在相同条件下测试两种分类器架构',
+        },
+        'hyperparameters': {
+            'epochs': [30],
+            'batch_size': [16, 32],
+            'learning_rate': [1e-3, 2e-3],
+            'data_fractions': [1.0, 0.5, 0.2],
+            'seeds': [42, 123, 456],
+            'classifier_types': ['linear', 'mlp'],
+            'mlp_layers': [1, 2, 3],  # 对比不同MLP层数的效果
+            'freeze_encoder': [True, False],
+        },
+    }
+}
+
+# 使用方法：
+# 1. 将上述任意配置复制到主CONFIG中
+# 2. 修改experiment_meta字段来描述你的实验
+# 3. 运行脚本即可
