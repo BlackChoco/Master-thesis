@@ -295,11 +295,11 @@ class ForestManager:
         analysis = self.analyze_node_distribution()
         
         print("=" * 80)
-        print("🌲 森林节点分布分析报告")
+        print(" 森林节点分布分析报告")
         print("=" * 80)
         
         # 基本统计
-        print(f"📊 基本统计:")
+        print(f" 基本统计:")
         print(f"   总节点数: {analysis['total_nodes']}")
         print(f"   子树数量: {analysis['subtree_count']}")
         print(f"   平均每棵子树节点数: {analysis['avg_nodes_per_subtree']:.2f}")
@@ -308,7 +308,7 @@ class ForestManager:
         
         # 详细统计
         detailed = analysis['detailed_stats']
-        print(f"\n📈 详细统计:")
+        print(f"\n 详细统计:")
         print(f"   中位数: {detailed['median_size']:.2f}")
         print(f"   标准差: {detailed['std_size']:.2f}")
         print(f"   25th百分位: {detailed['percentiles']['25th']:.2f}")
@@ -317,14 +317,14 @@ class ForestManager:
         print(f"   95th百分位: {detailed['percentiles']['95th']:.2f}")
         
         # 直方图
-        print(f"\n📊 节点数量分布直方图:")
+        print(f"\n 节点数量分布直方图:")
         for range_key, data in analysis['histogram'].items():
             if data['count'] > 0:
                 bar = "█" * min(50, data['count'])
                 print(f"   {range_key:>8} 节点 | {bar} ({data['count']} 棵, {data['percentage']:.1f}%)")
         
         # 规模分类
-        print(f"\n🏷️  子树规模分类:")
+        print(f"\n  子树规模分类:")
         for category, data in analysis['size_distribution'].items():
             category_name = {
                 'small_trees': '小型子树',
@@ -335,7 +335,7 @@ class ForestManager:
             print(f"   {category_name} ({data['description']}): {data['count']} 棵 ({data['percentage']:.1f}%)")
         
         # 精确频率分布（仅显示前10个最常见的大小）
-        print(f"\n🔍 精确节点数频率分布 (前10名):")
+        print(f"\n 精确节点数频率分布 (前10名):")
         sorted_freq = sorted(detailed['size_frequency'].items(), key=lambda x: x[1], reverse=True)
         for size, freq in sorted_freq[:10]:
             percentage = (freq / analysis['subtree_count'] * 100) if analysis['subtree_count'] > 0 else 0
@@ -763,12 +763,12 @@ class PostStorage:
         analysis = self.analyze_all_similarity_distributions()
         
         print("=" * 100)
-        print("📊 所有帖子相似度分布分析报告")
+        print(" 所有帖子相似度分布分析报告")
         print("=" * 100)
         
         # 总体摘要
         summary = analysis['summary']
-        print(f"📋 总体摘要:")
+        print(f" 总体摘要:")
         print(f"   分析帖子数: {summary['total_posts']}")
         print(f"   有效相似度帖子数: {summary['posts_with_valid_similarities']}")
         print(f"   总相似度对数: {summary['total_similarity_pairs']}")
@@ -776,7 +776,7 @@ class PostStorage:
         # 总体分布统计
         overall = analysis['overall_distribution']
         if 'error' not in overall:
-            print(f"\n🎯 所有帖子加总相似度分布:")
+            print(f"\n 所有帖子加总相似度分布:")
             print(f"   样本数量: {overall['count']}")
             print(f"   平均值: {overall['mean']:.4f}")
             print(f"   标准差: {overall['std']:.4f}")
@@ -787,14 +787,14 @@ class PostStorage:
             print(f"   90th百分位: {overall['percentiles']['90']:.4f}")
             print(f"   95th百分位: {overall['percentiles']['95']:.4f}")
         else:
-            print(f"\n❌ 总体分布: {overall['error']}")
+            print(f"\n 总体分布: {overall['error']}")
         
         # 各帖子详细分布（显示前10个）
         individual = analysis['individual_distributions']
         valid_posts = [(post_id, dist) for post_id, dist in individual.items() if 'error' not in dist]
         
         if valid_posts:
-            print(f"\n📋 各帖子详细分布 (前10个):")
+            print(f"\n 各帖子详细分布 (前10个):")
             print("-" * 100)
             print(f"{'帖子ID':<20} {'样本数':<8} {'平均值':<10} {'标准差':<10} {'中位数':<10} {'范围':<20}")
             print("-" * 100)
@@ -810,7 +810,7 @@ class PostStorage:
         
         # 分布差异分析
         if len(valid_posts) > 1:
-            print(f"\n📈 分布差异分析:")
+            print(f"\n 分布差异分析:")
             means = [dist['mean'] for _, dist in valid_posts]
             stds = [dist['std'] for _, dist in valid_posts]
             
@@ -871,9 +871,9 @@ class PostStorage:
         
         # 打印总结
         print(f"\n剪枝完成！")
-        print(f"✅ 成功剪枝: {len(results)} 个帖子")
+        print(f" 成功剪枝: {len(results)} 个帖子")
         if failed_posts:
-            print(f"❌ 失败: {len(failed_posts)} 个帖子")
+            print(f" 失败: {len(failed_posts)} 个帖子")
             for post_id, error in failed_posts:
                 print(f"   - {post_id}: {error}")
         
@@ -930,11 +930,11 @@ class PostStorage:
             return
         
         print("=" * 100)
-        print("🌳 所有帖子森林统计报告")
+        print(" 所有帖子森林统计报告")
         print("=" * 100)
         
         # 总体统计
-        print(f"📊 总体统计:")
+        print(f" 总体统计:")
         print(f"   处理帖子数: {stats['total_posts']}")
         print(f"   总子树数: {stats['total_subtrees']}")
         print(f"   总节点数: {stats['total_nodes']}")
@@ -944,7 +944,7 @@ class PostStorage:
         print(f"   平均每个帖子剪边数: {stats['avg_cut_edges_per_post']:.2f}")
         
         # 各帖子详细统计（只显示前10个）
-        print(f"\n📋 各帖子详细统计 (前10个):")
+        print(f"\n 各帖子详细统计 (前10个):")
         print("-" * 100)
         print(f"{'帖子ID':<20} {'子树数':<8} {'节点数':<8} {'剪边数':<8} {'平均子树大小':<12}")
         print("-" * 100)
@@ -1044,7 +1044,7 @@ class PostStorage:
             samples_per_group: 每个分布区间采样的子树数量，默认为1
         """
         if not self.forests:
-            print("❌ 没有森林数据")
+            print(" 没有森林数据")
             return
         
         # 收集所有子树，按大小分组
@@ -1084,28 +1084,28 @@ class PostStorage:
                     subtree_groups['100+'].append((post_id, subtree))
         
         print("=" * 120)
-        print(f"🎲 从不同分布区间采样子树进行可视化 (每组采样 {samples_per_group} 个)")
+        print(f" 从不同分布区间采样子树进行可视化 (每组采样 {samples_per_group} 个)")
         print("=" * 120)
         
         total_sampled = 0
         for group_name, subtrees in subtree_groups.items():
             if not subtrees:
-                print(f"\n📊 分布区间 [{group_name}个节点]: 无数据")
+                print(f"\n 分布区间 [{group_name}个节点]: 无数据")
                 continue
             
             # 确定实际采样数量
             actual_samples = min(samples_per_group, len(subtrees))
             
             print(f"\n{'='*80}")
-            print(f"📊 分布区间: [{group_name}个节点] - 总数: {len(subtrees)} 棵，采样: {actual_samples} 棵")
+            print(f" 分布区间: [{group_name}个节点] - 总数: {len(subtrees)} 棵，采样: {actual_samples} 棵")
             print(f"{'='*80}")
             
             # 如果采样数量等于总数，则显示所有子树；否则随机采样
             if actual_samples == len(subtrees):
-                print(f"💡 该区间子树数量不足 {samples_per_group} 个，显示全部 {len(subtrees)} 棵子树")
+                print(f" 该区间子树数量不足 {samples_per_group} 个，显示全部 {len(subtrees)} 棵子树")
                 selected_subtrees = subtrees
             else:
-                print(f"🎯 从 {len(subtrees)} 棵子树中随机采样 {actual_samples} 棵")
+                print(f" 从 {len(subtrees)} 棵子树中随机采样 {actual_samples} 棵")
                 selected_subtrees = random.sample(subtrees, actual_samples)
             
             # 可视化选中的子树
@@ -1113,23 +1113,23 @@ class PostStorage:
                 total_sampled += 1
                 
                 print(f"\n{'-'*60}")
-                print(f"🌳 样本 {i+1}/{actual_samples} (总第 {total_sampled} 个)")
+                print(f" 样本 {i+1}/{actual_samples} (总第 {total_sampled} 个)")
                 print(f"{'-'*60}")
-                print(f"📍 来源帖子: {post_id}")
-                print(f"📊 子树大小: {sampled_subtree['size']} 个节点")
-                print(f"📏 子树深度: {sampled_subtree['depth']} 层")
+                print(f" 来源帖子: {post_id}")
+                print(f" 子树大小: {sampled_subtree['size']} 个节点")
+                print(f" 子树深度: {sampled_subtree['depth']} 层")
                 
                 # 可视化这个子树
-                print(f"\n🌲 子树结构:")
+                print(f"\n 子树结构:")
                 self._visualize_subtree_simple(sampled_subtree['root'])
         
         if total_sampled == 0:
-            print("❌ 没有找到可采样的子树")
+            print(" 没有找到可采样的子树")
         else:
-            print(f"\n✅ 成功采样并可视化了 {total_sampled} 个子树")
+            print(f"\n 成功采样并可视化了 {total_sampled} 个子树")
             
             # 显示采样统计
-            print(f"\n📊 采样统计:")
+            print(f"\n 采样统计:")
             for group_name, subtrees in subtree_groups.items():
                 if subtrees:
                     actual_samples = min(samples_per_group, len(subtrees))
@@ -1141,7 +1141,7 @@ class PostStorage:
         从不同的直方图分布中各随机采样1个子树并可视化
         """
         if not self.forests:
-            print("❌ 没有森林数据")
+            print(" 没有森林数据")
             return
         
         # 收集所有子树，按大小分组
@@ -1181,14 +1181,14 @@ class PostStorage:
                     subtree_groups['100+'].append((post_id, subtree))
         
         print("=" * 120)
-        print("🎲 从不同分布区间随机采样子树进行可视化")
+        print(" 从不同分布区间随机采样子树进行可视化")
         print("=" * 120)
         
         
         sampled_count = 0
         for group_name, subtrees in subtree_groups.items():
             if not subtrees:
-                print(f"\n📊 分布区间 [{group_name}个节点]: 无数据")
+                print(f"\n 分布区间 [{group_name}个节点]: 无数据")
                 continue
             
             # 随机选择一个子树
@@ -1196,21 +1196,21 @@ class PostStorage:
             sampled_count += 1
             
             print(f"\n{'='*80}")
-            print(f"🌳 样本 {sampled_count} - 分布区间: [{group_name}个节点]")
+            print(f" 样本 {sampled_count} - 分布区间: [{group_name}个节点]")
             print(f"{'='*80}")
-            print(f"📍 来源帖子: {post_id}")
-            print(f"📊 子树大小: {sampled_subtree['size']} 个节点")
-            print(f"📏 子树深度: {sampled_subtree['depth']} 层")
-            print(f"🔢 该区间总数: {len(subtrees)} 棵子树")
+            print(f" 来源帖子: {post_id}")
+            print(f" 子树大小: {sampled_subtree['size']} 个节点")
+            print(f" 子树深度: {sampled_subtree['depth']} 层")
+            print(f" 该区间总数: {len(subtrees)} 棵子树")
             
             # 可视化这个子树
-            print(f"\n🌲 子树结构:")
+            print(f"\n 子树结构:")
             self._visualize_subtree_simple(sampled_subtree['root'])
         
         if sampled_count == 0:
-            print("❌ 没有找到可采样的子树")
+            print(" 没有找到可采样的子树")
         else:
-            print(f"\n✅ 成功采样并可视化了 {sampled_count} 个不同分布区间的子树")
+            print(f"\n 成功采样并可视化了 {sampled_count} 个不同分布区间的子树")
         print("=" * 120)
     
     def _visualize_subtree_simple(self, node, depth=0, prefix=""):
@@ -1295,7 +1295,7 @@ class PostStorage:
             min_subtree_size: 显示子树的最小节点数量，默认为1
         """
         if not self.forests:
-            print("❌ 没有森林数据可供可视化")
+            print(" 没有森林数据可供可视化")
             return
         
         # 选择要可视化的森林
@@ -1303,31 +1303,31 @@ class PostStorage:
             post_id = list(self.forests.keys())[0]
         
         if post_id not in self.forests:
-            print(f"❌ 帖子 {post_id} 的森林不存在")
+            print(f" 帖子 {post_id} 的森林不存在")
             return
         
         forest = self.forests[post_id]
         
         print("=" * 120)
-        print(f"🌲 帖子 {post_id} 剪枝后森林结构可视化")
+        print(f" 帖子 {post_id} 剪枝后森林结构可视化")
         print("=" * 120)
         
         # 显示基本统计信息
         stats = forest.get_forest_statistics()
-        print(f"📊 森林统计: {stats.get('subtree_count', 0)} 棵子树, "
+        print(f" 森林统计: {stats.get('subtree_count', 0)} 棵子树, "
               f"{stats.get('total_nodes', 0)} 个节点, "
               f"{stats.get('cut_edges_count', 0)} 条被剪边")
-        print(f"🎯 相似度阈值: {forest.similarity_threshold}")
+        print(f" 相似度阈值: {forest.similarity_threshold}")
         
         # 过滤满足最小大小要求的子树
         filtered_subtrees = [subtree for subtree in forest.subtrees if subtree['size'] >= min_subtree_size]
         
         if not filtered_subtrees:
-            print(f"❌ 没有找到节点数 >= {min_subtree_size} 的子树")
+            print(f" 没有找到节点数 >= {min_subtree_size} 的子树")
             return
         
-        print(f"🔍 筛选条件: 显示节点数 >= {min_subtree_size} 的子树")
-        print(f"📊 筛选结果: {len(filtered_subtrees)}/{len(forest.subtrees)} 棵子树符合条件")
+        print(f" 筛选条件: 显示节点数 >= {min_subtree_size} 的子树")
+        print(f" 筛选结果: {len(filtered_subtrees)}/{len(forest.subtrees)} 棵子树符合条件")
         
         # 构建被剪边的映射关系
         cut_edge_map = {}
@@ -1342,24 +1342,24 @@ class PostStorage:
         
         for i, subtree_info in enumerate(subtrees_to_show):
             print(f"\n{'='*60}")
-            print(f"🌳 子树 {i+1}/{len(filtered_subtrees)}")
+            print(f" 子树 {i+1}/{len(filtered_subtrees)}")
             print(f"{'='*60}")
-            print(f"📍 根节点ID: {subtree_info['root'].comment_id}")
-            print(f"📊 大小: {subtree_info['size']} 个节点")
-            print(f"📏 深度: {subtree_info['depth']} 层")
-            print(f"🔗 原始父节点: {subtree_info['original_parent_id']}")
+            print(f" 根节点ID: {subtree_info['root'].comment_id}")
+            print(f" 大小: {subtree_info['size']} 个节点")
+            print(f" 深度: {subtree_info['depth']} 层")
+            print(f" 原始父节点: {subtree_info['original_parent_id']}")
             
             # 显示从这个节点被剪掉的边
             root_id = subtree_info['root'].comment_id
             if show_cut_edges and root_id in cut_edge_map:
-                print(f"\n✂️  从此节点剪掉的边:")
+                print(f"\n  从此节点剪掉的边:")
                 for edge in cut_edge_map[root_id]:
                     similarity = edge['similarity_score']
                     child_id = edge['child_id']
                     reason = edge['reason']
                     print(f"   ┈┈┈ {root_id} ┈┈┈▷ {child_id} (相似度: {similarity:.4f}, 原因: {reason})")
             
-            print(f"\n🌲 子树结构:")
+            print(f"\n 子树结构:")
             self._visualize_subtree(subtree_info['root'], max_depth, cut_edge_map, show_cut_edges)
         
         # 如果有更多子树未显示
@@ -1425,7 +1425,7 @@ class PostStorage:
         显示被剪边的汇总信息
         """
         print(f"\n{'='*60}")
-        print("✂️  被剪边汇总信息")
+        print("  被剪边汇总信息")
         print(f"{'='*60}")
         
         # 按相似度分组统计
@@ -1461,14 +1461,14 @@ class PostStorage:
                 else:
                     similarity_ranges['0.9-1.0'] += 1
         
-        print(f"📊 总被剪边数: {len(forest.cut_edges)}")
+        print(f" 总被剪边数: {len(forest.cut_edges)}")
         if valid_similarities:
-            print(f"📈 相似度统计:")
+            print(f" 相似度统计:")
             print(f"   平均值: {np.mean(valid_similarities):.4f}")
             print(f"   中位数: {np.median(valid_similarities):.4f}")
             print(f"   范围: {min(valid_similarities):.4f} - {max(valid_similarities):.4f}")
             
-            print(f"\n📊 相似度分布:")
+            print(f"\n 相似度分布:")
             for range_name, count in similarity_ranges.items():
                 if count > 0:
                     percentage = count / len(valid_similarities) * 100
@@ -1481,7 +1481,7 @@ class PostStorage:
             reason = edge['reason']
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
         
-        print(f"\n🔍 剪边原因统计:")
+        print(f"\n 剪边原因统计:")
         for reason, count in reason_counts.items():
             percentage = count / len(forest.cut_edges) * 100
             print(f"   {reason}: {count} ({percentage:.1f}%)")
@@ -1495,7 +1495,7 @@ class PostStorage:
             max_depth: 显示的最大深度
         """
         print("=" * 140)
-        print("🔄 原始树 vs 剪枝后森林对比")
+        print(" 原始树 vs 剪枝后森林对比")
         print("=" * 140)
         
         # 构建被剪边的集合
@@ -1503,7 +1503,7 @@ class PostStorage:
         for edge in self.cut_edges:
             cut_edges.add((edge['parent_id'], edge['child_id']))
         
-        print("📊 对比统计:")
+        print(" 对比统计:")
         original_stats = self._count_original_tree_stats(original_tree.root)
         forest_stats = self.get_forest_statistics()
         
@@ -1514,6 +1514,6 @@ class PostStorage:
         print(f"   被剪掉: {len(self.cut_edges)} 条边 "
               f"({len(self.cut_edges)/original_stats['total_edges']*100:.1f}%)")
         
-        print(f"\n🌳 原始树结构 (标记被剪边):")
+        print(f"\n 原始树结构 (标记被剪边):")
         print("-" * 70)
         self._visualize_original_with_cuts(original_tree.root, cut_edges, max_depth)
