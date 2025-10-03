@@ -105,7 +105,7 @@ class ContrastiveDataset1(Dataset):
         return content
 
     def _build_dataset(self, max_samples_per_post: Optional[int]):
-        print("🔨 构建Dataset1: 父子评论相似度对比学习数据集")
+        print(" 构建Dataset1: 父子评论相似度对比学习数据集")
         total_pairs = 0
         for post_id, forest in tqdm(self.post_storage.forests.items(), desc="处理帖子(Dataset1)"):
             post_pairs = []
@@ -123,7 +123,7 @@ class ContrastiveDataset1(Dataset):
             self.positive_pairs.extend(post_pairs)
             total_pairs += len(post_pairs)
             self._collect_comments_for_negative_sampling(forest, post_id)
-        print(f"✅ Dataset1构建完成: {total_pairs} 个正样本对，覆盖 {len(self.comments_by_post)} 个帖子")
+        print(f" Dataset1构建完成: {total_pairs} 个正样本对，覆盖 {len(self.comments_by_post)} 个帖子")
 
     def _extract_high_similarity_pairs(self, root, post_id) -> List[Dict]:
         pairs = []
@@ -179,7 +179,8 @@ class ContrastiveDataset1(Dataset):
             'positive_content': self._ensure_str_content(pair['child_content']),
             'post_id': pair['post_id'],
             'similarity_score': pair['similarity'],
-            'pair_type': 'parent_child'
+            'pair_type': 'parent_child',
+            'sample_index': idx  #  新增：样本索引，用于加权训练
         }
     
     def get_negative_samples(self, post_id: str, num_negatives: int = 1) -> List[str]:
@@ -221,7 +222,7 @@ class ContrastiveDataset2(Dataset):
         return content
 
     def _build_dataset(self, max_samples_per_subtree: Optional[int]):
-        print("🔨 构建Dataset2: 节点-子树中心对比学习数据集")
+        print(" 构建Dataset2: 节点-子树中心对比学习数据集")
         total_pairs = 0
         for post_id, forest in tqdm(self.post_storage.forests.items(), desc="处理帖子(Dataset2)"):
             post_pairs = []
@@ -240,7 +241,7 @@ class ContrastiveDataset2(Dataset):
             self.positive_pairs.extend(post_pairs)
             total_pairs += len(post_pairs)
             self._collect_comments_for_negative_sampling(forest, post_id)
-        print(f"✅ Dataset2构建完成: {total_pairs} 个正样本对，覆盖 {len(self.comments_by_post)} 个帖子")
+        print(f" Dataset2构建完成: {total_pairs} 个正样本对，覆盖 {len(self.comments_by_post)} 个帖子")
 
     def _collect_subtree_node_contents(self, root) -> List[str]:
         contents = []
@@ -308,7 +309,8 @@ class ContrastiveDataset2(Dataset):
             'post_id': pair['post_id'],
             'subtree_size': pair['subtree_size'],
             'pair_type': 'node_center',
-            'is_center_embedding': False
+            'is_center_embedding': False,
+            'sample_index': idx  #  新增：样本索引，用于加权训练
         }
 
     def get_negative_samples(self, post_id: str, num_negatives: int = 1) -> List[str]:
@@ -390,10 +392,11 @@ class ContrastiveDataCollator:
         
         return {
             'anchor_texts': anchor_texts,
-            'positive_texts_ds1': positive_texts_ds1, 
-            'positive_content_lists_ds2': positive_content_lists_ds2, 
+            'positive_texts_ds1': positive_texts_ds1,
+            'positive_content_lists_ds2': positive_content_lists_ds2,
             'negative_texts': negative_texts,
             'post_ids': [item['post_id'] for item in batch],
             'pair_types': [item.get('pair_type', 'unknown') for item in batch],
+            'sample_indices': [item.get('sample_index', -1) for item in batch],  #  新增：样本索引
             'num_negatives': self.num_negatives
         }

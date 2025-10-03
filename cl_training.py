@@ -63,10 +63,10 @@ def load_trained_model_and_tokenizer(checkpoint_path: str):
         )
         # --- 新增：如果使用了PEFT，重新包装模型 ---
         if use_peft:
-            print("🔧 检测到PEFT训练的checkpoint，正在重新应用LoRA配置...")
+            print(" 检测到PEFT训练的checkpoint，正在重新应用LoRA配置...")
             lora_config = LoraConfig(**peft_config)
             encoder.base_model = get_peft_model(encoder.base_model, lora_config)
-            print("✅ LoRA配置已重新应用。")
+            print(" LoRA配置已重新应用。")
         # ------------------------------------
     else:
         print(f"错误: Checkpoint中未知的模型类型 '{model_type}'")
@@ -74,7 +74,7 @@ def load_trained_model_and_tokenizer(checkpoint_path: str):
 
     encoder.load_state_dict(checkpoint['contrastive_encoder_state_dict'])
     encoder.eval() # 设置为评估模式
-    print(f"✅ {model_type.upper()} ContrastiveEncoder 加载完成并设置为评估模式。")
+    print(f" {model_type.upper()} ContrastiveEncoder 加载完成并设置为评估模式。")
     
     # 返回基础模型和分词器
     return encoder.base_model, encoder.tokenizer, model_type
@@ -108,7 +108,8 @@ class DynamicContrastiveTrainer:
                  simcse_temperature: float = 0.05,
                  simcse_dropout_rate: float = 0.1,
                  simcse_remove_duplicates: bool = True,  # 新增：是否去重
-                 hybrid_ratio: float = 0.5):
+                 hybrid_ratio: float = 0.5,
+                 output_dir: Optional[str] = None):
 
         self.post_storage = post_storage
         self.training_model_type = training_model_type.lower()
@@ -121,6 +122,7 @@ class DynamicContrastiveTrainer:
         self.num_negatives = num_negatives if infonce_mode != 'in_batch' else 0
         self.batch_size = batch_size
         self.pruning_inference_batch_size = pruning_inference_batch_size
+        self.output_dir = output_dir  # 保存输出目录
         self.infonce_mode = infonce_mode
 
         self.min_subtree_size_ds1 = min_subtree_size_ds1
@@ -139,11 +141,11 @@ class DynamicContrastiveTrainer:
                 self.loss_weights = {'dataset1': 0.5, 'dataset2': 0.5}
             self.adaptive_weighting = adaptive_weighting
             self.initial_loss_weights = self.loss_weights.copy()
-            print(f"🎯 启用损失加权: {self.loss_weights}, 自适应: {self.adaptive_weighting}")
+            print(f" 启用损失加权: {self.loss_weights}, 自适应: {self.adaptive_weighting}")
         else:
             self.loss_weights = {'dataset1': 1.0, 'dataset2': 1.0}
             self.adaptive_weighting = False
-            print("📊 使用独立损失（每个数据集的损失乘以其权重，默认为1.0）")
+            print(" 使用独立损失（每个数据集的损失乘以其权重，默认为1.0）")
 
         # --- 新增：正样本对策略配置 ---
         self.positive_pair_strategy = positive_pair_strategy.lower()
@@ -156,7 +158,7 @@ class DynamicContrastiveTrainer:
         if self.positive_pair_strategy not in ['comment_reply', 'simcse_dropout', 'hybrid']:
             raise ValueError(f"不支持的正样本对策略: {positive_pair_strategy}. 可选: 'comment_reply', 'simcse_dropout', 'hybrid'")
         
-        print(f"🎯 正样本对构造策略: {self.positive_pair_strategy}")
+        print(f" 正样本对构造策略: {self.positive_pair_strategy}")
         if self.positive_pair_strategy == 'simcse_dropout':
             print(f"   SimCSE温度参数: {self.simcse_temperature}")
             print(f"   SimCSE dropout率: {self.simcse_dropout_rate}")
@@ -172,10 +174,10 @@ class DynamicContrastiveTrainer:
 
         self.vocab = None
         if self.training_model_type == 'textcnn':
-            print("🛠️ 使用 TextCNN 模型进行训练。")
+            print(" 使用 TextCNN 模型进行训练。")
             if self.textcnn_config is None:
                 raise ValueError("当 training_model_type 为 'textcnn' 时，textcnn_config 是必需的")
-            print("🏗️ 从 PostStorage 为 TextCNN 构建词汇表...")
+            print(" 从 PostStorage 为 TextCNN 构建词汇表...")
             self.vocab, _ = build_vocab_from_post_storage(self.post_storage, min_freq=self.textcnn_config.get('min_vocab_freq', 1))
             self.contrastive_encoder = ContrastiveEncoder(
                 model_type='textcnn',
@@ -187,7 +189,7 @@ class DynamicContrastiveTrainer:
             ).to(self.device)
             print(f"   TextCNN 模型名称 (标识符): {self.training_model_identifier_or_path}")
         elif self.training_model_type == 'modelscope':
-            print(f"🛠️ 使用 ModelScope 模型进行训练: {self.training_model_identifier_or_path}")
+            print(f"  使用 ModelScope 模型进行训练: {self.training_model_identifier_or_path}")
             if self.training_model_identifier_or_path is None:
                  raise ValueError("对于 'modelscope' 模型类型，training_model_identifier_or_path 是必需的。")
             self.contrastive_encoder = ContrastiveEncoder(
@@ -199,7 +201,7 @@ class DynamicContrastiveTrainer:
             ).to(self.device)
              # --- 新增：应用PEFT/LoRA的逻辑 ---
             if self.use_peft:
-                print("🚀 应用PEFT (LoRA)到基础模型...")
+                print(" 应用PEFT (LoRA)到基础模型...")
                 
                 # 定义默认LoRA配置，并与用户传入的配置合并
                 default_lora_config = {
@@ -216,13 +218,13 @@ class DynamicContrastiveTrainer:
                 # 将基础模型包装成PeftModel
                 self.contrastive_encoder.base_model = get_peft_model(self.contrastive_encoder.base_model, lora_config)
                 
-                print("✅ LoRA应用完成。可训练参数详情:")
+                print(" LoRA应用完成。可训练参数详情:")
                 self.contrastive_encoder.base_model.print_trainable_parameters()
             # --- PEFT逻辑结束 ---
         else:
             raise ValueError(f"不支持的训练模型类型: {self.training_model_type}。请选择 'modelscope' 或 'textcnn'。")
 
-        print(f"🔍 初始化剪枝模型: {self.pruning_model_path}")
+        print(f" 初始化剪枝模型: {self.pruning_model_path}")
         # 使用为ModelScope定义的辅助函数加载剪枝模型
         self.pruning_tokenizer = load_tokenizer_from_modelscope(self.pruning_model_path)
         self.pruning_model = load_model_from_modelscope(
@@ -244,17 +246,17 @@ class DynamicContrastiveTrainer:
         if self.use_weighted_loss:
             self.training_history['weight_ds1'] = []
             self.training_history['weight_ds2'] = []
-        print(f"🚀 DynamicContrastiveTrainer 初始化完成。设备: {self.device}")
+        print(f" DynamicContrastiveTrainer 初始化完成。设备: {self.device}")
 
     def _load_pruning_model_to_gpu(self):
         if not self.pruning_model_on_gpu and self.device.type == 'cuda':
-            print("🔧 将剪枝模型加载到GPU...")
+            print(" 将剪枝模型加载到GPU...")
             self.pruning_model.to(self.device)
             self.pruning_model_on_gpu = True
 
     def _unload_pruning_model_from_gpu(self):
         if self.pruning_model_on_gpu and self.device.type == 'cuda':
-            print("🔧 从GPU卸载剪枝模型...")
+            print(" 从GPU卸载剪枝模型...")
             self.pruning_model.to('cpu')
             self.pruning_model_on_gpu = False
             torch.cuda.empty_cache()
@@ -302,7 +304,7 @@ class DynamicContrastiveTrainer:
         return all_embeddings_np
 
     def _build_and_log_datasets(self):
-        print("🛠️ 构建/重建数据集...")
+        print(" 构建/重建数据集...")
         print("   收集所有评论用于剪枝模型嵌入...")
         all_comment_texts = []
         comment_nodes_references = []
@@ -368,32 +370,48 @@ class DynamicContrastiveTrainer:
             min_subtree_size=self.min_subtree_size_ds1,
             max_samples_per_post=self.max_samples_per_post_ds1
         )
-        print("   创建 Dataset2...")
-        self.dataset2 = ContrastiveDataset2(
-            post_storage=self.post_storage,
-            min_subtree_size=self.min_subtree_size_ds2,
-            max_samples_per_subtree=self.max_samples_per_subtree_ds2
-        )
+
+        # 只有权重>0时才创建Dataset2
+        if self.loss_weights.get('dataset2', 0) > 0:
+            print("   创建 Dataset2...")
+            self.dataset2 = ContrastiveDataset2(
+                post_storage=self.post_storage,
+                min_subtree_size=self.min_subtree_size_ds2,
+                max_samples_per_subtree=self.max_samples_per_subtree_ds2
+            )
+        else:
+            print("   跳过 Dataset2 (权重为0)...")
+            self.dataset2 = None
 
         ds1_size = len(self.dataset1)
-        ds2_size = len(self.dataset2)
+        ds2_size = len(self.dataset2) if self.dataset2 else 0
         self.training_history['dataset_sizes']['dataset1'].append(ds1_size)
         self.training_history['dataset_sizes']['dataset2'].append(ds2_size)
         print(f"   Dataset1 大小: {ds1_size}, Dataset2 大小: {ds2_size}")
 
         if ds1_size == 0 and ds2_size == 0:
-            print("⚠️ 警告: 两个数据集都为空。训练可能无法有效进行。")
+            print(" 警告: 两个数据集都为空。训练可能无法有效进行。")
 
         collator_num_neg = self.num_negatives
         self.collator1 = ContrastiveDataCollator(self.dataset1, num_negatives=collator_num_neg)
-        self.collator2 = ContrastiveDataCollator(self.dataset2, num_negatives=collator_num_neg)
+
+        # 只有Dataset2存在且权重>0时才创建collator2
+        if self.dataset2 and self.loss_weights.get('dataset2', 0) > 0:
+            self.collator2 = ContrastiveDataCollator(self.dataset2, num_negatives=collator_num_neg)
+        else:
+            self.collator2 = None
 
         self.train_loader1 = DataLoader(self.dataset1, batch_size=self.batch_size, shuffle=True, collate_fn=self.collator1, num_workers=0, pin_memory=True if self.device.type == 'cuda' else False) if ds1_size > 0 else None
-        self.train_loader2 = DataLoader(self.dataset2, batch_size=self.batch_size, shuffle=True, collate_fn=self.collator2, num_workers=0, pin_memory=True if self.device.type == 'cuda' else False) if ds2_size > 0 else None
-        print("✅ 数据集和 DataLoader 已准备就绪。")
+
+        # 只有Dataset2存在且权重>0时才创建train_loader2
+        if self.dataset2 and ds2_size > 0 and self.loss_weights.get('dataset2', 0) > 0:
+            self.train_loader2 = DataLoader(self.dataset2, batch_size=self.batch_size, shuffle=True, collate_fn=self.collator2, num_workers=0, pin_memory=True if self.device.type == 'cuda' else False)
+        else:
+            self.train_loader2 = None
+        print(" 数据集和 DataLoader 已准备就绪。")
 
         # --- 新增代码：保存构建好的数据集 ---
-        print("💾 正在保存构建好的数据集...")
+        print(" 正在保存构建好的数据集...")
         save_dir = "cl_dataset"
         os.makedirs(save_dir, exist_ok=True)
 
@@ -410,21 +428,21 @@ class DynamicContrastiveTrainer:
                     pickle.dump(self.dataset1, f)
                 print(f"   -> Dataset1 已保存至: {ds1_filepath}")
             except Exception as e:
-                print(f"   -> ❌ 保存 Dataset1 失败: {e}")
+                print(f"   ->  保存 Dataset1 失败: {e}")
         else:
             print("   -> Dataset1 为空，不进行保存。")
 
         # 保存 Dataset2
-        if ds2_size > 0:
+        if self.dataset2 and ds2_size > 0:
             ds2_filepath = os.path.join(save_dir, f"{base_filename}_dataset2.pkl")
             try:
                 with open(ds2_filepath, 'wb') as f:
                     pickle.dump(self.dataset2, f)
                 print(f"   -> Dataset2 已保存至: {ds2_filepath}")
             except Exception as e:
-                print(f"   -> ❌ 保存 Dataset2 失败: {e}")
+                print(f"   ->  保存 Dataset2 失败: {e}")
         else:
-            print("   -> Dataset2 为空，不进行保存。")
+            print("   -> Dataset2 为空或未启用，不进行保存。")
 
     def _process_batch(self, batch: Dict, loss_fn: ContrastiveLoss, dataset_name: str) -> Optional[torch.Tensor]:
         self.optimizer.zero_grad()
@@ -448,14 +466,14 @@ class DynamicContrastiveTrainer:
             processed_anchors_count = len(current_anchor_texts)
             if processed_anchors_count == 0: return None
 
-            # --- 🎯 根据策略选择正样本对构造方式 ---
+            # ---  根据策略选择正样本对构造方式 ---
             if self.positive_pair_strategy == 'comment_reply':
                 # 原有的评论-回复策略
                 anchor_emb = self.contrastive_encoder(current_anchor_texts)
                 positive_emb = self.contrastive_encoder(current_positive_texts)
                 
             elif self.positive_pair_strategy == 'simcse_dropout':
-                # 🎯 改进的SimCSE策略：使用所有可用文本（父评论+子评论）
+                #  改进的SimCSE策略：使用所有可用文本（父评论+子评论）
                 self.contrastive_encoder.train()  # 确保dropout激活
                 
                 # 合并所有有效文本
@@ -706,7 +724,8 @@ class DynamicContrastiveTrainer:
 
 
             # Dataset 2 训练循环
-            if self.train_loader2 and len(self.train_loader2) > 0:
+            if (self.train_loader2 and len(self.train_loader2) > 0 and
+                self.loss_weights.get('dataset2', 0) > 0):
                 print(f"在 Dataset2 上训练 (大小: {len(self.dataset2)} 样本, {len(self.train_loader2)} 批次)")
                 progress_bar_ds2 = tqdm(self.train_loader2, desc=f"Epoch {epoch+1} DS2", leave=False, dynamic_ncols=True)
                 for batch2 in progress_bar_ds2:
@@ -715,7 +734,7 @@ class DynamicContrastiveTrainer:
                         epoch_losses_ds2.append(loss2_val.item())
                         progress_bar_ds2.set_postfix(loss=f"{loss2_val.item():.4f}")
             else:
-                print("Dataset2 为空或未加载，跳过训练。")
+                print("Dataset2 训练被跳过 (权重为0或未启用)")
 
 
             avg_loss_ds1 = np.mean(epoch_losses_ds1) if epoch_losses_ds1 else 0.0
@@ -809,7 +828,7 @@ class DynamicContrastiveTrainer:
                 if epoch_losses_ds1 or epoch_losses_ds2: # 仅当实际发生训练时才保存
                     best_overall_loss = current_epoch_combined_loss
                     patience_counter = 0
-                    print(f"🎉 发现新的最佳模型! 组合损失: {best_overall_loss:.4f}. 保存模型...")
+                    print(f" 发现新的最佳模型! 组合损失: {best_overall_loss:.4f}. 保存模型...")
                     self.save_checkpoint(epoch + 1, best_overall_loss, is_best=True)
                 else:
                     print("此轮未执行训练步骤。跳过最佳模型检查。")
@@ -818,13 +837,13 @@ class DynamicContrastiveTrainer:
                 print(f"耐心计数: {patience_counter}/{scheduler.patience}")
 
             if patience_counter > scheduler.patience: # 注意：scheduler.patience 是 ReduceLROnPlateau 的参数
-                print("🛑 早停触发。")
+                print(" 早停触发。")
                 break
             self.plot_training_progress(save_plot=False, show_plot=False) # 生成绘图数据以备保存
 
-        print("🏁 训练完成。")
+        print(" 训练完成。")
         # 保存最终模型，无论是否最佳
-        # self.save_checkpoint(epoch + 1, current_epoch_combined_loss, is_best=False, final_save=True)
+        self.save_checkpoint(epoch + 1, current_epoch_combined_loss, is_best=True, final_save=True)
         self.plot_training_progress(save_plot=True, show_plot=True) # 保存并显示最终绘图
 
 
@@ -873,7 +892,7 @@ class DynamicContrastiveTrainer:
             state['textcnn_config'] = self.textcnn_config
             state['vocab'] = self.vocab
 
-        # 🎯 改进的保存路径：包含模型名、策略、相似度阈值
+        #  改进的保存路径：包含模型名、策略、相似度阈值
         # 1. 处理模型名称
         model_name = self.training_model_identifier_or_path.replace('/', '_').replace('-', '_')
         
@@ -887,7 +906,13 @@ class DynamicContrastiveTrainer:
         
         # 4. 组合文件夹名
         experiment_folder_name = f"{model_name}_{strategy_name}_sim{similarity_str}"
-        save_dir = os.path.join("model", experiment_folder_name)
+
+        # 使用传入的output_dir或默认目录
+        if self.output_dir:
+            save_dir = self.output_dir
+        else:
+            save_dir = os.path.join("model", experiment_folder_name)
+
         os.makedirs(save_dir, exist_ok=True)
 
         # 生成损失图的PNG字节
@@ -900,19 +925,19 @@ class DynamicContrastiveTrainer:
             plot_filepath = os.path.join(save_dir, "training_loss_plot.png")
             with open(plot_filepath, 'wb') as f:
                 f.write(fig_bytes)
-            print(f"📊 训练损失图已保存至: {plot_filepath}")
+            print(f" 训练损失图已保存至: {plot_filepath}")
 
         # 定义并保存最优模型的checkpoint文件
         filepath = os.path.join(save_dir, "best_contrastive_model.pth")
         torch.save(state, filepath)
-        print(f"✅ 最优模型已更新并保存至: {filepath}")
-        print(f"📁 实验文件夹: {experiment_folder_name}")
+        print(f" 最优模型已更新并保存至: {filepath}")
+        print(f" 实验文件夹: {experiment_folder_name}")
 
         # 可选：保存基础模型到独立目录
         base_model_dir = os.path.join(save_dir, f"trained_{self.training_model_type}_embedding_model")
         os.makedirs(base_model_dir, exist_ok=True)
         self.contrastive_encoder.save_base_model(base_model_dir)
-        print(f"🔧 基础模型已保存至: {base_model_dir}")
+        print(f" 基础模型已保存至: {base_model_dir}")
 
 
     def plot_training_progress(self, save_plot=False, show_plot=True, return_bytes=False):
@@ -995,7 +1020,7 @@ class DynamicContrastiveTrainer:
         #     plot_filename = f"training_progress_{self.training_model_identifier_or_path.replace('/', '_')}_{self.training_model_type}.png"
         #     with open(plot_filename, 'wb') as f:
         #         f.write(plot_bytes_val)
-        #     print(f"📈 训练进度图已保存到 {plot_filename}")
+        #     print(f" 训练进度图已保存到 {plot_filename}")
 
         # if show_plot:
         #     # 由于使用了 'Agg' 后端，plt.show() 不会显示任何内容。
@@ -1012,12 +1037,12 @@ def build_pruned_forest(post_storage: PostStorage, similarity_threshold: float):
     """
     基于相似度阈值构建剪枝后的森林
     """
-    print("🔄 构建剪枝森林...")
+    print(" 构建剪枝森林...")
     post_storage.forests.clear()
     pruning_results = post_storage.prune_all_posts_by_similarity(
         similarity_threshold=similarity_threshold, show_progress=True
     )
-    print(f"✅ 森林构建完成: {len(pruning_results)} 个帖子")
+    print(f" 森林构建完成: {len(pruning_results)} 个帖子")
     return pruning_results
 
 def fine_tune_contrastive_model(
@@ -1099,7 +1124,7 @@ def fine_tune_contrastive_model(
         if avg_loss < best_loss - min_improvement:
             best_loss = avg_loss
             patience_counter = 0
-            print(f"💾 保存当前最佳模型，损失: {best_loss:.4f}")
+            print(f" 保存当前最佳模型，损失: {best_loss:.4f}")
             # 可以选择保存模型
             # torch.save(model.state_dict(), "best_contrastive_model.pth")
         else:
@@ -1107,7 +1132,7 @@ def fine_tune_contrastive_model(
             print(f"⏳ 等待更优模型，当前计数器: {patience_counter}/{scheduler_patience}")
 
         if patience_counter >= scheduler_patience:
-            print("🛑 早停触发，停止训练")
+            print(" 早停触发，停止训练")
 
 
 

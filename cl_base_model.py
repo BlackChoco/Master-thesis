@@ -14,16 +14,16 @@ def load_model_from_modelscope(model_name_or_path: str, trust_remote_code: bool 
     优先从ModelScope加载模型，失败时提示用户
     """
     try:
-        print(f"🔍 正在从ModelScope加载模型: {model_name_or_path}")
+        print(f"  正在从ModelScope加载模型: {model_name_or_path}")
         model = AutoModel.from_pretrained(
             model_name_or_path, 
             trust_remote_code=trust_remote_code,
             **kwargs
         )
-        print(f"✅ 成功从ModelScope加载模型: {model_name_or_path}")
+        print(f"  成功从ModelScope加载模型: {model_name_or_path}")
         return model
     except Exception as e:
-        print(f"❌ 从ModelScope加载模型失败: {model_name_or_path}")
+        print(f"  从ModelScope加载模型失败: {model_name_or_path}")
         print(f"错误信息: {e}")
         print("请检查模型名称是否正确，或网络连接是否正常。")
         raise e
@@ -34,16 +34,16 @@ def load_tokenizer_from_modelscope(model_name_or_path: str, trust_remote_code: b
     优先从ModelScope加载分词器，失败时提示用户
     """
     try:
-        print(f"🔍 正在从ModelScope加载分词器: {model_name_or_path}")
+        print(f"  正在从ModelScope加载分词器: {model_name_or_path}")
         tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path, 
             trust_remote_code=trust_remote_code,
             **kwargs
         )
-        print(f"✅ 成功从ModelScope加载分词器: {model_name_or_path}")
+        print(f"  成功从ModelScope加载分词器: {model_name_or_path}")
         return tokenizer
     except Exception as e:
-        print(f"❌ 从ModelScope加载分词器失败: {model_name_or_path}")
+        print(f"  从ModelScope加载分词器失败: {model_name_or_path}")
         print(f"错误信息: {e}")
         print("请检查模型名称是否正确，或网络连接是否正常。")
         raise e
@@ -202,7 +202,7 @@ class TextCNNModel(torch.nn.Module):
 
 class ContrastiveEncoder(torch.nn.Module):
     """
-    🔧 修改后的对比编码器：支持ModelScope AutoModel和自定义TextCNN。
+    修改后的对比编码器：支持ModelScope AutoModel和自定义TextCNN。
     """
     def __init__(self, model_type: str,
                  model_name_or_path: Optional[str] = None,
@@ -247,7 +247,7 @@ class ContrastiveEncoder(torch.nn.Module):
                 except Exception as e:
                      raise ValueError(f"尝试确定ModelScope模型 {model_name_or_path} 基础维度时出错: {e}")
 
-            print(f"🏗️ ModelScope ContrastiveEncoder 初始化完成:")
+            print(f"  ModelScope ContrastiveEncoder 初始化完成:")
             print(f"   基础模型: {model_name_or_path}")
 
         elif self.model_type == 'textcnn':
@@ -265,7 +265,7 @@ class ContrastiveEncoder(torch.nn.Module):
                 dropout_rate=textcnn_config.get('model_dropout_rate', 0.1)
             )
             self.base_dim = textcnn_config['textcnn_output_dim']
-            print(f"🏗️ TextCNN ContrastiveEncoder 初始化完成:")
+            print(f"  TextCNN ContrastiveEncoder 初始化完成:")
             print(f"   TextCNN 词汇表大小: {len(vocab)}")
             print(f"   TextCNN 配置: {textcnn_config}")
         else:
@@ -372,7 +372,7 @@ class ContrastiveEncoder(torch.nn.Module):
         if self.model_type == 'modelscope':
             self.base_model.save_pretrained(path)
             self.tokenizer.save_pretrained(path)
-            print(f"💾 ModelScope 基础模型和分词器已保存到: {path}")
+            print(f"  ModelScope 基础模型和分词器已保存到: {path}")
         elif self.model_type == 'textcnn':
             model_save_path = os.path.join(path, "textcnn_model.pth")
             vocab_save_path = os.path.join(path, "textcnn_vocab.json")
@@ -386,8 +386,8 @@ class ContrastiveEncoder(torch.nn.Module):
             with open(tokenizer_config_path, 'w', encoding='utf-8') as f:
                 json.dump(tokenizer_config, f, ensure_ascii=False, indent=4)
 
-            print(f"💾 TextCNN 基础模型 state_dict 已保存到: {model_save_path}")
-            print(f"💾 TextCNN 词汇表已保存到: {vocab_save_path}")
-            print(f"💾 TextCNN 分词器配置已保存到: {tokenizer_config_path}")
+            print(f"  TextCNN 基础模型 state_dict 已保存到: {model_save_path}")
+            print(f"  TextCNN 词汇表已保存到: {vocab_save_path}")
+            print(f"  TextCNN 分词器配置已保存到: {tokenizer_config_path}")
         else:
-            print(f"⚠️ 未知模型类型 '{self.model_type}'，无法保存基础模型。")
+            print(f"  未知模型类型 '{self.model_type}'，无法保存基础模型。")
