@@ -120,27 +120,85 @@ class EnhancedContrastiveDataset(Dataset):
             print(f" Linear策略：保留所有 {len(self.enhanced_samples)} 个样本")
 
         elif strategy == 'threshold':
-            # Threshold策略：预过滤 + 等权重
-            print(f" Threshold策略：过滤阈值={threshold}，预过滤低置信样本")
+            # Threshold strategy: filter by configurable cutoff and assign binary weights
+            try:
+                filter_threshold = float(threshold) if threshold is not None else 0.4
+            except (TypeError, ValueError):
+                print(f" Threshold strategy: invalid threshold {threshold}, fallback to 0.4")
+                filter_threshold = 0.4
 
-            # 预过滤：只保留高置信样本
-            valid_mask = scores >= threshold
+            if filter_threshold <= 0 or filter_threshold >= 1:
+                print(f" Threshold strategy: threshold {filter_threshold} out of (0,1), fallback to 0.4")
+                filter_threshold = 0.4
+
+            print(f" Threshold strategy: using cutoff={filter_threshold} to pre-filter low-confidence samples")
+
+            # Keep only samples with confidence >= threshold
+            valid_mask = scores >= filter_threshold
             valid_indices = np.where(valid_mask)[0]
 
             if len(valid_indices) == 0:
-                print(f" 警告：没有样本超过阈值 {threshold}，保留所有样本")
+                print(f" Warning: no samples above threshold {filter_threshold}, keep all samples")
                 self.sample_weights = np.ones_like(scores)
             else:
-                # 为所有样本设置权重：高置信=1，低置信=0
-                self.sample_weights = np.where(scores >= threshold, 1.0, 0.0)
+                # Binary weights: keep high-confidence samples, drop the rest
+                self.sample_weights = np.where(valid_mask, 1.0, 0.0)
 
-                print(f" Threshold策略：标记 {len(valid_indices)}/{len(scores)} "
-                      f"({len(valid_indices)/len(scores):.1%}) 个高置信样本")
-                print(f" 被过滤样本的置信度范围: [{np.min(scores[~valid_mask]):.4f}, {np.max(scores[~valid_mask]):.4f}]" if np.any(~valid_mask) else " 无样本被过滤")
-                print(f" 保留样本的置信度范围: [{np.min(scores[valid_indices]):.4f}, {np.max(scores[valid_indices]):.4f}]")
+                print(f" Threshold strategy: flagged {len(valid_indices)}/{len(scores)} "
+                      f"({len(valid_indices)/len(scores):.1%}) high-confidence samples")
+                low_range = f"[0, {filter_threshold:.2f})"
+                high_range = f"[{filter_threshold:.2f}, 1.0]"
+                if np.any(~valid_mask):
+                    print(f" Filtered samples {low_range} confidence range: "
+                          f"[{np.min(scores[~valid_mask]):.4f}, {np.max(scores[~valid_mask]):.4f}]")
+                else:
+                    print(" No samples filtered out")
+                print(f" Retained samples {high_range} confidence range: "
+                      f"[{np.min(scores[valid_indices]):.4f}, {np.max(scores[valid_indices]):.4f}]")
+
+        elif strategy == 'tiered':
+            # Tiered策略：分层离散权重
+            # [0, 0.4) → 0.0 (作为负例)
+            # [0.4, 0.6) → 0.5 (低置信)
+            # [0.6, 0.8) → 0.7 (中置信)
+            # [0.8, 1.0] → 0.9 (高置信)
+            print(f" Tiered策略：分层离散权重")
+            print(f"   [0.0, 0.4) → weight=0.0 (作为负例)")
+            print(f"   [0.4, 0.6) → weight=0.5 (低置信)")
+            print(f"   [0.6, 0.8) → weight=0.7 (中置信)")
+            print(f"   [0.8, 1.0] → weight=0.9 (高置信)")
+
+            # 初始化权重数组
+            self.sample_weights = np.zeros_like(scores)
+
+            # 分层赋权
+            tier1_mask = (scores >= 0.0) & (scores < 0.4)   # 负例
+            tier2_mask = (scores >= 0.4) & (scores < 0.6)   # 低置信
+            tier3_mask = (scores >= 0.6) & (scores < 0.8)   # 中置信
+            tier4_mask = (scores >= 0.8) & (scores <= 1.0)  # 高置信
+
+            self.sample_weights[tier1_mask] = 0.0
+            self.sample_weights[tier2_mask] = 0.5
+            self.sample_weights[tier3_mask] = 0.7
+            self.sample_weights[tier4_mask] = 0.9
+
+            # 统计各层样本数量
+            tier1_count = np.sum(tier1_mask)
+            tier2_count = np.sum(tier2_mask)
+            tier3_count = np.sum(tier3_mask)
+            tier4_count = np.sum(tier4_mask)
+            total_count = len(scores)
+
+            print(f" Tiered策略样本分布：")
+            print(f"   Tier 1 [0.0, 0.4) (负例): {tier1_count}/{total_count} ({tier1_count/total_count:.1%})")
+            print(f"   Tier 2 [0.4, 0.6) (低置信): {tier2_count}/{total_count} ({tier2_count/total_count:.1%})")
+            print(f"   Tier 3 [0.6, 0.8) (中置信): {tier3_count}/{total_count} ({tier3_count/total_count:.1%})")
+            print(f"   Tier 4 [0.8, 1.0] (高置信): {tier4_count}/{total_count} ({tier4_count/total_count:.1%})")
+            print(f"   有效训练样本 (weight>0): {tier2_count + tier3_count + tier4_count}/{total_count} "
+                  f"({(tier2_count + tier3_count + tier4_count)/total_count:.1%})")
 
         else:
-            raise ValueError(f"不支持的权重策略: {strategy}，请使用 'linear' 或 'threshold'")
+            raise ValueError(f"不支持的权重策略: {strategy}，请使用 'linear', 'threshold' 或 'tiered'")
 
     def _get_effective_sample_count(self) -> int:
         """获取有效样本数量（权重>0的样本）"""
@@ -368,10 +426,12 @@ class WeightedContrastiveTrainer:
         print(f"   批次数量: {len(self.dataloader)}")
         print(f"   权重策略: {self.weighting_strategy}")
         if self.weighting_strategy == 'threshold':
-            print(f"   过滤阈值: {self.weight_threshold}")
-            print(f"   策略说明: 预过滤低置信样本，剩余样本等权重训练")
+            print(f"   过滤阈值: 0.4 (固定)")
+            print(f"   策略说明: 预过滤[0,0.4)低置信样本，剩余样本等权重训练")
         elif self.weighting_strategy == 'linear':
             print(f"   策略说明: 使用原始一致性得分[0,1]作为样本权重")
+        elif self.weighting_strategy == 'tiered':
+            print(f"   策略说明: 分层离散权重 - [0,0.4)→0.0(负例), [0.4,0.6)→0.5, [0.6,0.8)→0.7, [0.8,1.0]→0.9")
 
     def _load_pretrained_model(self):
         """加载预训练的对比学习模型"""
@@ -586,8 +646,9 @@ class WeightedContrastiveTrainer:
 
                         final_loss = torch.mean(loss)  # 简单平均，无需加权
 
-                    elif self.weighting_strategy == 'linear':
-                        # Linear策略：使用一致性得分作为权重
+                    elif self.weighting_strategy == 'linear' or self.weighting_strategy == 'tiered':
+                        # Linear策略：使用一致性得分作为权重 [0,1]
+                        # Tiered策略：使用分层离散权重 {0.0, 0.5, 0.7, 0.9}
                         anchor_emb = self.contrastive_encoder(anchor_texts)
                         positive_emb = self.contrastive_encoder(positive_texts)
 
@@ -599,7 +660,7 @@ class WeightedContrastiveTrainer:
                             # 使用标准的in-batch InfoNCE损失
                             loss = self._compute_inbatch_infonce_loss(anchor_emb, positive_emb)
 
-                        # 应用一致性权重（不归一化）
+                        # 应用权重（不归一化）
                         weights_tensor = torch.tensor(weights, device=loss.device, dtype=loss.dtype)
                         # 确保分母是有效样本数，不包含0权重样本
                         valid_weights = weights_tensor[weights_tensor > 0]
@@ -907,11 +968,11 @@ def parse_arguments():
                        help='预训练对比学习模型路径 (.pth) [必需]')
 
     parser.add_argument('--weighting-strategy', '-w', type=str, default='linear',
-                       choices=['linear', 'exponential', 'threshold', 'rank_based'],
+                       choices=['linear', 'threshold', 'tiered'],
                        help='权重策略 (默认: linear)')
 
-    parser.add_argument('--weight-threshold', '-t', type=float, default=0,
-                       help='权重阈值 (默认: 0.3)')
+    parser.add_argument('--weight-threshold', '-t', type=float, default=0.4,
+                       help='权重阈值 (默认: 0.4，仅threshold和tiered策略使用)')
 
     parser.add_argument('--epochs', '-ep', type=int, default=100,
                        help='训练轮数 (默认: 100)')

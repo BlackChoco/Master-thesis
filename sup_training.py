@@ -568,10 +568,10 @@ def evaluate_model(model, data_loader, loss_fn, device, id_to_label: dict):
 CONFIG = {
     # 实验元信息
     'experiment_meta': {
-        'description': '0.75_0.1_round1__experiment',  # 实验描述标识符
-        'experiment_name': 'mlp在6个标签均衡数据集',   # 实验的中文名称
-        'purpose': '对比LoRA微调后的BERT与原始BERT在不同数据量下的性能表现（均衡数据集）,在第一阶段对比学习训练的编码器上进行加权对比损失训练',  # 实验目的
-        'notes': '使用mlp，测试5个不同数据比例',  # 实验备注
+        'description': 'robert&bert_linear_experiment',  # 实验描述标识符
+        'experiment_name': 'roberta和bert在不同数据比例下线性评估结果',   # 实验的中文名称
+        'purpose': '跑roberta和bert在线性评估下的baseline',  # 实验目的
+        'notes': '对齐实验配置',  # 实验备注
     },
 
     # 数据配置
@@ -590,19 +590,20 @@ CONFIG = {
     'models': {
         # 'lora_bert_base_chinese_cl': 'model/google-bert_bert-base-chinese/best_contrastive_model.pth',
         # 'TextCNN_CL_bert': 'model/my_custom_textcnn_v3_bert_pruning_paircl/best_contrastive_model.pth',
-        # 'Bert_base_chinese_nocl': 'google-bert/bert-base-chinese',
-        '0.75_round1_0.1_cl_bert' : 'iter_model/frac0.1_round1/best_model.pth'
+        'RoBERTa_base_chinese': 'iic/nlp_roberta_backbone_base_std',
+        'Bert_base_chinese': 'google-bert/bert-base-chinese',
+        # '0.75_round1_0.1_cl_bert' : 'iter_model/frac0.1_round1/best_model.pth'
     },
 
     # 超参数搜索空间
     'hyperparameters': {
-        'epochs': [100],                    # 训练轮数      [50,100]
-        'batch_size':[16] ,              # 批次大小         [16,32,64,128]
-        'learning_rate': [1e-3], # 学习率       [1e-3,1e-4]
+        'epochs': [50,100],                    # 训练轮数      [50,100]
+        'batch_size':[16,32,64] ,              # 批次大小         [16,32,64,128]
+        'learning_rate': [1e-2,1e-3], # 学习率       [1e-3,1e-4]
         'data_fractions': [1.0, 0.5, 0.2, 0.1, 0.05, 0.02],  # 数据使用比例       [1.0, 0.5, 0.2, 0.1, 0.05, 0.02]
         'seeds': [42, 123, 456, 789, 101, 202, 303, 404, 505, 606],             # 随机种子
-        'classifier_types': ['mlp'], # 分类器类型
-        'mlp_hidden_neurons': [512,384,256],  # MLP隐藏层神经元数量
+        'classifier_types': ['linear'], # 分类器类型
+        'mlp_hidden_neurons': [512],  # MLP隐藏层神经元数量
         'freeze_encoder': [True],     # 是否冻结编码器
     },
 
@@ -912,7 +913,7 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
     print(f"    Macro精确率: {test_metrics['precision']:.4f}")
     print(f"    Macro召回率: {test_metrics['recall']:.4f}")
     print(f"    Macro F1分数: {test_metrics['f1_score']:.4f}")
-    print(f"    Micro F1分数: {test_metrics['f1_micro']:.4f} (验证: {'✓' if abs(test_metrics['f1_micro'] - test_metrics['accuracy']) < 0.001 else '✗'})")
+    print(f"    Micro F1分数: {test_metrics['f1_micro']:.4f} (验证: {'OK' if abs(test_metrics['f1_micro'] - test_metrics['accuracy']) < 0.001 else 'X'})")
 
     # 显示每个类别的详细指标
     print(f"  各类别详细指标:")
@@ -1211,8 +1212,8 @@ def save_experiment_results(results, config, output_dir=None):
                 'f1_score': metrics['f1_score'],
                 'precision': metrics['precision'],
                 'recall': metrics['recall'],
-                'f1_micro': metrics.get('f1_micro', 0),
-                'per_class_metrics': metrics.get('per_class_metrics', {})
+                'f1_micro': metrics.get('f1_micro', 0)
+                # 移除 per_class_metrics 以避免 pandas mean() 错误
             })
 
         # 计算统计信息
