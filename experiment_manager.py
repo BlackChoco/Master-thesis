@@ -71,6 +71,43 @@ class ExperimentStatusDetector:
 
         return False, None
 
+    def detect_stage2_contrastive_status(self) -> Tuple[bool, Optional[str]]:
+        """检测Stage2加权对比学习是否完成
+
+        Returns:
+            (是否完成, 模型路径)
+        """
+        # 检查当前轮次的contrastive_training目录
+        contrastive_dir = os.path.join(self.round_dir, "contrastive_training")
+
+        if not os.path.exists(contrastive_dir):
+            return False, None
+
+        # 查找Stage2模型文件
+        for file in os.listdir(contrastive_dir):
+            if file.endswith('.pth') and 'best' in file.lower():
+                model_path = os.path.join(contrastive_dir, file)
+
+                # 验证是否是Stage2模型
+                try:
+                    checkpoint = self._load_checkpoint(model_path)
+
+                    # 检查Stage2标记
+                    if checkpoint.get('training_stage') == 'weighted_contrastive':
+                        print(f"  [OK] 找到Stage2模型: {model_path}")
+                        return True, model_path
+
+                    # 检查training_history中的second_stage标记
+                    if checkpoint.get('training_history', {}).get('second_stage_training', False):
+                        print(f"  [OK] 找到Stage2模型: {model_path}")
+                        return True, model_path
+
+                except Exception as e:
+                    print(f"  [警告] 无法加载模型 {model_path}: {e}")
+                    continue
+
+        return False, None
+
     def detect_supervised_learning_status(self) -> Tuple[bool, Optional[str]]:
         """检测监督学习是否完成
 
@@ -176,6 +213,7 @@ class ExperimentStatusDetector:
 
         for pattern in enhanced_dataset_patterns:
             files = glob.glob(os.path.join(scoring_dir, "**", pattern), recursive=True)
+            files = [f for f in files if '_noise_eval' not in os.path.basename(f)]
             if files:
                 # 使用最新的文件
                 latest_file = max(files, key=os.path.getmtime)
@@ -187,55 +225,11 @@ class ExperimentStatusDetector:
 
                     if isinstance(data, dict) and 'samples' in data:
                         sample_count = len(data['samples'])
-                        print(f"  [OK] 找到增强数据集: {os.path.basename(latest_file)} ({sample_count} 样本)")
+                        print(f"  [OK] 找到增强数据集 {os.path.basename(latest_file)} ({sample_count} 样本)")
                         return True, latest_file
 
                 except Exception as e:
                     print(f"  [警告] 无法加载增强数据集 {latest_file}: {e}")
-
-        return False, None
-
-    def detect_stage2_contrastive_status(self) -> Tuple[bool, Optional[str]]:
-        """检测Stage2对比学习是否完成
-
-        Returns:
-            (是否完成, 模型路径)
-        """
-        # 首先检查round目录下的best_model.pth
-        round_model_path = os.path.join(self.round_dir, "best_model.pth")
-        if os.path.exists(round_model_path):
-            print(f"  [OK] 找到Stage2模型: {round_model_path}")
-            return True, round_model_path
-
-        # Stage2模型可能保存在 round{n}/contrastive_model/ 或 iter_model/
-        possible_dirs = [
-            os.path.join(self.round_dir, "contrastive_model"),
-            os.path.join(self.output_dir, "iter_model")
-        ]
-
-        for search_dir in possible_dirs:
-            if not os.path.exists(search_dir):
-                continue
-
-            for root, dirs, files in os.walk(search_dir):
-                if "best_model.pth" in files:
-                    model_path = os.path.join(root, "best_model.pth")
-
-                    try:
-                        checkpoint = self._load_checkpoint(model_path)
-
-                        # 检查是否是Stage2的模型
-                        if checkpoint.get('training_stage') == 'weighted_contrastive':
-                            print(f"  [OK] 找到Stage2模型: {model_path}")
-                            return True, model_path
-
-                        # 或者检查training_history中的标记
-                        if checkpoint.get('training_history', {}).get('second_stage_training', False):
-                            print(f"  [OK] 找到Stage2模型: {model_path}")
-                            return True, model_path
-
-                    except Exception as e:
-                        print(f"  [警告] 无法加载模型 {model_path}: {e}")
 
         return False, None
 
@@ -277,8 +271,9 @@ class ExperimentStatusDetector:
         sup_done, _ = self.detect_supervised_learning_status()
         summary['supervised_learning'] = sup_done
 
-        cls_done, _ = self.detect_classifier_selection_status()
-        summary['classifier_selection'] = cls_done
+        # ❌ 移除分类器选择检测
+        # cls_done, _ = self.detect_classifier_selection_status()
+        # summary['classifier_selection'] = cls_done
 
         cons_done, _ = self.detect_consistency_scoring_status()
         summary['consistency_scoring'] = cons_done
@@ -366,8 +361,7 @@ class ExperimentStateManager:
     def get_next_pending_stage(self, round_num: int) -> Optional[str]:
         """获取下一个需要执行的阶段"""
         stages = ['stage1_contrastive'] if round_num == 1 else ['stage2_contrastive']
-        stages.extend(['supervised_learning', 'classifier_selection',
-                      'consistency_scoring'])
+        stages.extend(['supervised_learning', 'consistency_scoring'])  # ❌ 移除classifier_selection
 
         for stage in stages:
             if not self.is_stage_completed(round_num, stage):
@@ -377,8 +371,7 @@ class ExperimentStateManager:
 
     def is_round_completed(self, round_num: int) -> bool:
         """检查整轮是否完成"""
-        required_stages = ['supervised_learning', 'classifier_selection',
-                          'consistency_scoring']
+        required_stages = ['supervised_learning', 'consistency_scoring']  # ❌ 移除classifier_selection
 
         if round_num == 1:
             required_stages.insert(0, 'stage1_contrastive')

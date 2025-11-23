@@ -104,6 +104,8 @@ class IterativeExperimentManager:
 
         # 初始化状态管理器
         self.state_manager = ExperimentStateManager(self.config, self.experiment_dir)
+        self._latest_supervised_output: Optional[Dict] = None
+        self._latest_classifier_output: Optional[Dict] = None
 
         print(f"迭代实验管理器初始化")
         print(f"实验目录: {self.experiment_dir}")
@@ -269,24 +271,26 @@ class IterativeExperimentManager:
             sup_done, sup_result_dir = detector.detect_supervised_learning_status()
             if sup_done and self.resume:
                 print("[跳过] ✅ 监督学习已完成")
+                # 从磁盘恢复最优模型信息
+                sup_output = self._load_supervised_output_from_disk(sup_result_dir)
             else:
                 print("[执行] ▶️  开始监督学习...")
-                sup_result_dir = self._run_supervised_training(encoder_path, round_config, round_dir)
-                self.state_manager.save_stage_completion(round_num, 'supervised_learning', sup_result_dir)
+                sup_output = self._run_supervised_training(encoder_path, round_config, round_dir)
+                self.state_manager.save_stage_completion(round_num, 'supervised_learning', sup_output['best_model_path'])
 
-            print(f"[完成] 监督学习完成: {sup_result_dir}")
+            best_model_path = sup_output['best_model_path']
+            print(f"[完成] 监督学习完成: {best_model_path}")
 
-            # Step 3: 分类器选择
-            cls_done, selected_classifiers = detector.detect_classifier_selection_status()
-            if cls_done and self.resume:
-                print("[跳过] ✅ 分类器选择已完成")
-                classifier_selection_dir = os.path.join(round_dir, "classifier_selection")
-            else:
-                print("[执行] ▶️  开始分类器选择...")
-                classifier_selection_dir = self._run_classifier_selection(sup_result_dir, round_config, round_dir)
-                self.state_manager.save_stage_completion(round_num, 'classifier_selection', classifier_selection_dir)
+            # ✅ 记录详细指标到实验日志
+            round_entry['best_model_path'] = best_model_path
+            round_entry['best_hyperparams'] = sup_output['hyperparameters']
+            round_entry['best_val_f1'] = sup_output.get('best_val_f1')
+            round_entry['best_epoch'] = sup_output.get('best_epoch')
+            round_entry['train_loss_at_best'] = sup_output.get('train_loss_at_best')
+            round_entry['metrics'] = sup_output['metrics']  # {train, dev, test}
+            self._save_log()
 
-            print(f"[完成] 分类器选择完成: {classifier_selection_dir}")
+            # ❌ Step 3: 分类器选择 - 已删除
 
             # Step 4: 一致性评分
             cons_done, enhanced_dataset = detector.detect_consistency_scoring_status()
@@ -296,7 +300,9 @@ class IterativeExperimentManager:
             else:
                 print("[执行] ▶️  开始一致性评分...")
                 consistency_result_dir = self._run_consistency_scoring(
-                    classifier_selection_dir, round_config, round_dir
+                    best_model_path,  # ✅ 直接传模型路径
+                    round_config,
+                    round_dir
                 )
                 self.state_manager.save_stage_completion(round_num, 'consistency_scoring', consistency_result_dir)
 
@@ -362,16 +368,27 @@ class IterativeExperimentManager:
             print(f"[完成] 编码器训练完成: {encoder_path}")
 
             # Step 2: 监督学习
-            sup_result_dir = self._run_supervised_training(encoder_path, round_config, round_dir)
-            print(f"[完成] 监督学习完成: {sup_result_dir}")
+            sup_output = self._run_supervised_training(encoder_path, round_config, round_dir)
+            best_model_path = sup_output['best_model_path']
+            print(f"[完成] 监督学习完成: {best_model_path}")
 
-            # Step 3: 分类器选择
-            classifier_selection_dir = self._run_classifier_selection(sup_result_dir, round_config, round_dir)
-            print(f"[完成] 分类器选择完成: {classifier_selection_dir}")
+            # ✅ 记录详细指标到实验日志
+            round_entry = self.experiment_log['rounds'][f'round{round_num}']
+            round_entry['best_model_path'] = best_model_path
+            round_entry['best_hyperparams'] = sup_output['hyperparameters']
+            round_entry['best_val_f1'] = sup_output.get('best_val_f1')
+            round_entry['best_epoch'] = sup_output.get('best_epoch')
+            round_entry['train_loss_at_best'] = sup_output.get('train_loss_at_best')
+            round_entry['metrics'] = sup_output['metrics']  # {train, dev, test}
+            self._save_log()
 
-            # Step 4: 一致性评分（所有轮次都执行，便于对比分析）
+            # ❌ Step 3: 分类器选择 - 已删除
+
+            # Step 4: 一致性评分
             consistency_result_dir = self._run_consistency_scoring(
-                classifier_selection_dir, round_config, round_dir
+                best_model_path,  # ✅ 直接传模型路径
+                round_config,
+                round_dir
             )
             print(f"[完成] 一致性评分完成: {consistency_result_dir}")
 
@@ -447,7 +464,7 @@ class IterativeExperimentManager:
             stage2_config, prev_encoder, prev_enhanced_dataset, round_dir, round_num
         )
 
-    def _run_supervised_training(self, encoder_path: str, config: Dict, round_dir: str) -> str:
+    def _run_supervised_training(self, encoder_path: str, config: Dict, round_dir: str) -> Dict:
         """运行监督学习"""
         print("[监督学习] 运行监督学习超参数搜索...")
 
@@ -462,7 +479,67 @@ class IterativeExperimentManager:
         # 从round_dir提取轮次号
         round_num = int(os.path.basename(round_dir).replace('round', ''))
 
-        return run_supervised_training_interface(encoder_path, sup_config, output_dir, round_num)
+        sup_result = run_supervised_training_interface(encoder_path, sup_config, output_dir, round_num)
+
+        # ✅ 直接返回完整的监督学习输出（包含best_model_path和metrics）
+        if isinstance(sup_result, dict):
+            sup_result.setdefault('experiment_dir', output_dir)
+            self._latest_supervised_output = sup_result
+            return sup_result
+
+        # 兼容旧版本接口仅返回目录路径的情况（不应该发生）
+        self._latest_supervised_output = {
+            'experiment_dir': sup_result,
+            'best_model_path': None,
+            'metrics': {},
+            'best_epoch': None,
+            'train_loss_at_best': None,
+            'hyperparameters': None,
+            'used_cache': False
+        }
+        return self._latest_supervised_output
+
+    def _load_supervised_output_from_disk(self, sup_result_dir: str) -> Dict:
+        """从监督学习结果目录恢复最佳模型信息"""
+        results_file = os.path.join(sup_result_dir, "all_seeds_results.json")
+        if not os.path.exists(results_file):
+            raise FileNotFoundError(f"找不到监督学习结果文件: {results_file}")
+
+        with open(results_file, 'r', encoding='utf-8') as f:
+            all_results = json.load(f)
+
+        # ✅ 基于验证集F1选择最优模型
+        best_entry = None
+        best_val_f1 = float('-inf')
+
+        for runs in all_results.values():
+            for run in runs:
+                val_f1 = run.get('val_f1', float('-inf'))
+                if val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    best_entry = run
+
+        if not best_entry:
+            raise RuntimeError(f"无法从 {results_file} 恢复监督学习最优结果")
+
+        model_path = best_entry.get('model_path')
+        if model_path and not os.path.isabs(model_path):
+            model_path = os.path.abspath(os.path.join(sup_result_dir, model_path))
+
+        return {
+            'experiment_dir': sup_result_dir,
+            'best_model_path': model_path,
+            'metrics': {
+                'train': best_entry.get('train_metrics'),
+                'dev': best_entry.get('val_metrics'),
+                'test': best_entry.get('test_metrics')
+            },
+            'best_epoch': best_entry.get('best_epoch'),
+            'train_loss_at_best': best_entry.get('train_loss_at_best'),
+            'hyperparameters': best_entry.get('hyperparameters'),
+            'used_cache': best_entry.get('used_cache', False),
+            'best_val_f1': best_val_f1  # ✅ 新增验证集F1
+        }
 
     def _run_classifier_selection(self, sup_result_dir: str, config: Dict, round_dir: str) -> str:
         """运行分类器选择"""
@@ -477,27 +554,14 @@ class IterativeExperimentManager:
         selection_config = config.get('classifier_selection', {})
         return run_classifier_selection_interface(sup_result_dir, selection_config, output_dir)
 
-    def _run_consistency_scoring(self, classifier_selection_dir: str, config: Dict, round_dir: str) -> str:
+    def _run_consistency_scoring(self, best_model_path: str, config: Dict, round_dir: str) -> str:
         """运行一致性评分"""
         print("[一致性评分] 运行一致性评分...")
 
         output_dir = os.path.join(round_dir, "consistency_scoring")
         os.makedirs(output_dir, exist_ok=True)
 
-        # 查找选中的分类器（使用配置中指定的比例）
         scoring_config = config.get('consistency_scoring', {})
-        selection_config = config.get('classifier_selection', {})
-
-        # 使用consistency_scoring_fraction配置
-        target_fraction = selection_config.get('consistency_scoring_fraction', 0.1)
-        print(f"   使用数据比例 {target_fraction} 的分类器进行一致性评分")
-
-        classifier_path = self._find_classifier_for_fraction(
-            os.path.dirname(classifier_selection_dir), target_fraction
-        )
-
-        if not classifier_path:
-            raise FileNotFoundError(f"找不到数据比例{target_fraction}的分类器")
 
         # 动态获取数据集路径
         dataset_path = self._find_current_dataset(round_dir)
@@ -523,13 +587,18 @@ class IterativeExperimentManager:
             raise FileNotFoundError(f"找不到第{round_num}轮的数据集")
 
         print(f"   使用数据集: {dataset_path}")
+        print(f"   使用模型: {best_model_path}")
         scoring_config['dataset_path'] = dataset_path
 
         if not run_consistency_scoring_interface:
             raise RuntimeError("一致性评分接口未实现")
 
+        # ✅ 直接传入模型路径，不再传classifier_path
         return run_consistency_scoring_interface(
-            classifier_path, dataset_path, scoring_config, output_dir
+            best_model_path,  # 直接传模型路径
+            dataset_path,
+            scoring_config,
+            output_dir
         )
 
     def _find_current_dataset(self, round_dir: str) -> Optional[str]:
@@ -685,6 +754,41 @@ class IterativeExperimentManager:
         print(f"    ✅ 已复制: round1/contrastive_training")
         print(f"    ⏭️  跳过: supervised_training, classifier_selection, consistency_scoring")
 
+    def _copy_round1_results(self, source_dir: str, target_dir: str,
+                             include_dirs: Optional[List[str]] = None,
+                             skip_dirs: Optional[List[str]] = None):
+        """
+        print("[警告] run_noise_variants_legacy 已弃用，将转发到 run_noise_variants。")
+        return self.run_noise_variants(
+            target_round=target_round,
+            noise_params=noise_params,
+            variant_dir_prefix=variant_dir_prefix
+        )
+        复制 Round 1 结果到目标实验（允许指定需要复用的子目录，并清理需要重新生成的目录）
+        """
+        include_dirs = include_dirs or ['contrastive_training', 'supervised_training', 'classifier_selection']
+        skip_dirs = skip_dirs or []
+
+        source_round1 = os.path.join(source_dir, 'round1')
+        target_round1 = os.path.join(target_dir, 'round1')
+        os.makedirs(target_round1, exist_ok=True)
+
+        for subdir in include_dirs:
+            src = os.path.join(source_round1, subdir)
+            if not os.path.exists(src):
+                raise FileNotFoundError(f"未找到要复用的目录: {src}")
+            dst = os.path.join(target_round1, subdir)
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            print(f"   ✅ 已复制: round1/{subdir}")
+
+        for subdir in skip_dirs:
+            dst = os.path.join(target_round1, subdir)
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+                print(f"   ♻️ 已清理: round1/{subdir}")
+
     def run_scoring_fraction_variants(self, target_round: int = 3,
                                       scoring_fractions: List[float] = None,
                                       variant_dir_prefix: str = None):
@@ -830,7 +934,7 @@ class IterativeExperimentManager:
             print(f"  - {self.experiment_dir}_frac{fraction_str}")
         print(f"{'='*60}")
 
-    def run_noise_variants(self, target_round: int = 3,
+    def run_noise_variants_legacy(self, target_round: int = 3,
                           noise_params: List[str] = None,
                           variant_dir_prefix: str = None):
         """
@@ -990,6 +1094,254 @@ class IterativeExperimentManager:
                 print(f"  - {variant_dir_prefix}_{variant_name}")
             else:
                 print(f"  - {self.experiment_dir}_{variant_name}")
+        print(f"{'='*60}")
+
+    def run_noise_variants(self, target_round: int = 3,
+                          noise_params: List[str] = None,
+                          variant_dir_prefix: str = None,
+                          noise_mode: str = 'by_bins',
+                          noise_threshold: float = 0.4,
+                          noise_pool: str = '0.0-0.01',
+                          noise_target_bins: Optional[str] = None,
+                          noise_seed: Optional[int] = None):
+        """
+        运行 Round 1 一致性评分噪声实验（复用对比学习与监督学习结果，仅扰动一致性数据集）
+        """
+        print(f"\n{'='*60}")
+        print("Round 1 一致性评分噪声实验（仅命令行配置）")
+        print(f"{'='*60}")
+
+        if not noise_params:
+            raise ValueError("必须提供 --noise-params 参数，例如：--noise-params 0.05 0.1")
+
+        def _parse_range(value: str, default: Tuple[float, float]) -> Tuple[float, float]:
+            cleaned = value.replace('[', '').replace(']', '').strip()
+            delimiter = '-' if '-' in cleaned else ','
+            parts = [p.strip() for p in cleaned.split(delimiter) if p.strip()]
+            if len(parts) != 2:
+                return default
+            try:
+                return float(parts[0]), float(parts[1])
+            except ValueError:
+                return default
+
+        def _parse_bins(value: Optional[str], default: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+            if not value:
+                return default
+            bins = []
+            for chunk in value.split(','):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                rng = _parse_range(chunk, None)
+                if rng:
+                    bins.append(rng)
+            return bins or default
+
+        base_noise_pool = _parse_range(noise_pool, (0.0, 0.01))
+        default_bins = [(noise_threshold, 0.6), (0.6, 0.8), (0.8, 1.0)]
+        base_target_bins = _parse_bins(noise_target_bins, default_bins)
+
+        def _format_fraction(frac: float) -> str:
+            return f"{frac:.3f}".rstrip('0').rstrip('.')
+
+        def _sanitize_token(token: str) -> str:
+            return token.replace('.', 'p').replace('-', 'to').replace(',', '_').replace(' ', '')
+
+        def _format_range_for_suffix(rng: Tuple[float, float]) -> str:
+            return _sanitize_token(f"{rng[0]:.2f}-{rng[1]:.2f}")
+
+        def _parse_noise_param(param_str: str, base_settings: dict) -> dict:
+            import copy
+            settings = copy.deepcopy(base_settings)
+            settings['fraction'] = None
+            settings['label'] = None
+
+            segments = [seg.strip() for seg in param_str.replace('|', ';').split(';') if seg.strip()]
+            for seg in segments:
+                if '=' in seg:
+                    key, value = seg.split('=', 1)
+                    key = key.strip().lower()
+                    value = value.strip()
+                    if key in ('fraction', 'frac', 'ratio', 'percent', 'percentage', 'p'):
+                        settings['fraction'] = float(value)
+                    elif key == 'mode':
+                        settings['mode'] = value
+                    elif key in ('threshold', 'noise_threshold'):
+                        settings['threshold'] = float(value)
+                    elif key in ('noise_pool', 'pool'):
+                        settings['noise_pool'] = _parse_range(value, settings['noise_pool'])
+                    elif key in ('target_bins', 'bins'):
+                        settings['target_bins'] = _parse_bins(value, settings['target_bins'])
+                    elif key == 'seed':
+                        settings['seed'] = int(value)
+                    elif key in ('apply', 'apply_to_dataset', 'write_back'):
+                        settings['apply_to_dataset'] = value.lower() in ('true', '1', 'yes', 'y')
+                    elif key in ('label', 'name', 'suffix'):
+                        settings['label'] = value
+                    else:
+                        print(f" [警告] 未识别的噪声参数键: {key}，已忽略")
+                else:
+                    settings['fraction'] = float(seg)
+
+            if settings.get('fraction') is None:
+                raise ValueError(f"噪声参数 '{param_str}' 缺少 fraction 配置")
+
+            if settings['mode'] != 'by_bins':
+                settings['target_bins'] = None
+
+            return settings
+
+        base_settings = {
+            'mode': noise_mode,
+            'threshold': noise_threshold,
+            'noise_pool': base_noise_pool,
+            'target_bins': base_target_bins,
+            'seed': noise_seed,
+            'apply_to_dataset': False
+        }
+
+        parsed_variants = []
+        print(f"\n将创建 {len(noise_params)} 个噪声变体：")
+        for param_str in noise_params:
+            settings = _parse_noise_param(param_str, base_settings)
+            parsed_variants.append(settings)
+            bins_desc = settings['target_bins'] if settings['target_bins'] else [(settings['threshold'], 1.0)]
+            bins_text = ', '.join([f"{b[0]}-{b[1]}" for b in bins_desc])
+            print(f"  - fraction={settings['fraction']}, mode={settings['mode']}, bins={bins_text}, pool={settings['noise_pool']}, apply_to_dataset={settings.get('apply_to_dataset', False)}")
+
+        print("\n实验说明：")
+        print("  1. 复用 Round 1 对比学习、监督学习和分类器选择结果")
+        print("  2. 只在一致性评分阶段注入噪声，生成新的增强数据集")
+        print(f"  3. Round 2-{target_round} 按原配置继续迭代")
+
+        import copy
+        import tempfile
+
+        variant_records = []
+
+        for settings in parsed_variants:
+            fraction_tag = _format_fraction(settings['fraction']).replace('.', '_')
+            if settings.get('label'):
+                label_suffix = settings['label']
+            else:
+                auto_parts = [settings['mode'], f"frac{fraction_tag}"]
+                if settings.get('target_bins'):
+                    bins_token = 'bins' + '_'.join(_format_range_for_suffix(b) for b in settings['target_bins'])
+                    auto_parts.append(bins_token)
+                else:
+                    auto_parts.append(_sanitize_token(f"thr{settings['threshold']:.2f}"))
+                pool_token = 'pool' + _format_range_for_suffix(settings['noise_pool'])
+                auto_parts.append(pool_token)
+                if settings.get('seed') is not None:
+                    auto_parts.append(f"seed{settings['seed']}")
+                if settings.get('apply_to_dataset', False):
+                    auto_parts.append('apply')
+                label_suffix = '_'.join(auto_parts)
+            variant_name = f"noise_{label_suffix}"
+
+            if variant_dir_prefix:
+                variant_dir = f"{variant_dir_prefix}_{label_suffix}"
+            else:
+                variant_dir = f"{self.experiment_dir}_{label_suffix}"
+
+            print(f"\n{'='*40}")
+            print(f"运行变体: {variant_name}")
+            print(f"  fraction={settings['fraction']}, mode={settings['mode']}, threshold={settings['threshold']}, pool={settings['noise_pool']}")
+            if settings.get('target_bins'):
+                print(f"  target_bins={settings['target_bins']}")
+            if settings.get('seed') is not None:
+                print(f"  seed={settings['seed']}")
+            print(f"  apply_to_dataset={settings.get('apply_to_dataset', False)}")
+            print(f"{'='*40}")
+
+            variant_config = copy.deepcopy(self.config)
+            noise_config = {
+                'enabled': True,
+                'mode': settings['mode'],
+                'threshold': settings['threshold'],
+                'fraction': settings['fraction'],
+                'noise_pool': list(settings['noise_pool']),
+                'target_bins': [list(b) for b in settings.get('target_bins') or []],
+                'seed': settings.get('seed'),
+                'apply_to_dataset': settings.get('apply_to_dataset', False)
+            }
+
+            variant_config['variant_meta'] = {
+                'type': 'noise_robustness',
+                'base_experiment': self.experiment_dir,
+                'noise_params': noise_config,
+                'creation_time': datetime.now().isoformat()
+            }
+
+            round_specific = variant_config.setdefault('round_specific', {})
+            round1_overrides = copy.deepcopy(round_specific.get(1, {}))
+            consistency_overrides = copy.deepcopy(round1_overrides.get('consistency_scoring', {}))
+            consistency_overrides['noise_injection'] = noise_config
+            round1_overrides['consistency_scoring'] = consistency_overrides
+            round_specific[1] = round1_overrides
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False, encoding='utf-8') as tmp_config:
+                yaml.dump(variant_config, tmp_config, allow_unicode=True)
+                tmp_config_path = tmp_config.name
+
+            try:
+                variant_manager = IterativeExperimentManager(
+                    config_path=tmp_config_path,
+                    experiment_dir=variant_dir,
+                    resume=True,
+                    force_restart=False
+                )
+                variant_manager.experiment_name = f"{self.experiment_name}_{label_suffix}"
+
+                self._copy_round1_results(
+                    self.experiment_dir,
+                    variant_dir,
+                    include_dirs=['contrastive_training', 'supervised_training', 'classifier_selection'],
+                    skip_dirs=['consistency_scoring', 'consistency_scores']
+                )
+
+                detector = ExperimentStatusDetector(variant_dir, 1)
+                stage1_done, stage1_path = detector.detect_stage1_contrastive_status()
+                if stage1_done and stage1_path:
+                    variant_manager.state_manager.save_stage_completion(
+                        1, 'stage1_contrastive', stage1_path,
+                        metadata={'reuse_from': self.experiment_dir}
+                    )
+
+                sup_done, sup_dir = detector.detect_supervised_learning_status()
+                if sup_done and sup_dir:
+                    variant_manager.state_manager.save_stage_completion(
+                        1, 'supervised_learning', sup_dir,
+                        metadata={'reuse_from': self.experiment_dir}
+                    )
+
+                cls_done, _ = detector.detect_classifier_selection_status()
+                if cls_done:
+                    cls_dir = os.path.join(variant_dir, 'round1', 'classifier_selection')
+                    variant_manager.state_manager.save_stage_completion(
+                        1, 'classifier_selection', cls_dir,
+                        metadata={'reuse_from': self.experiment_dir}
+                    )
+
+                variant_manager.run_experiment(start_round=1, target_round=target_round)
+                variant_records.append({'name': label_suffix, 'dir': variant_dir, 'status': 'completed'})
+                print(f"✅ 变体完成: {variant_dir}")
+
+            except Exception as exc:
+                variant_records.append({'name': label_suffix, 'dir': variant_dir, 'status': 'failed', 'error': str(exc)})
+                print(f"❌ 变体失败: {exc}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                if os.path.exists(tmp_config_path):
+                    os.remove(tmp_config_path)
+
+        print(f"\n{'='*60}")
+        print("噪声变体实验完成")
+        for record in variant_records:
+            flag = '✅' if record['status'] == 'completed' else '❌'
+            print(f" {flag} {record['name']}: {record['dir']}")
         print(f"{'='*60}")
 
     def run_multi_variant_experiment(self, target_round: int = 3,
@@ -1169,14 +1521,26 @@ def parse_arguments():
                        help='变体实验目录前缀（如：my_variants），默认使用基础实验目录名')
 
     parser.add_argument('--noise-round1-supervised', action='store_true',
-                       help='为 Round 1 监督学习添加噪声（重新训练监督学习）')
+                       help='为 Round 1 一致性评分注入噪声（复用对比学习与监督学习结果）')
 
     parser.add_argument('--noise-params', type=str, nargs='+',
                        default=None,
-                       help='Round 1 监督学习加噪参数组合，格式："epoch,lr[,batch_size]"。'
-                            '例如：--noise-params "5,1e-5" "10,1e-4,64" "20,5e-5,128"。'
+                       help='Round 1 噪声参数组合，示例："0.05" 或 '
+                            '"fraction=0.1;mode=all_above_threshold;label=wide"。'
                             'batch_size可选，不指定则使用配置文件默认值。'
+                            '支持键：fraction/frac、mode、threshold、noise_pool、target_bins、seed、label。'
                             '每个参数组合创建一个变体，完全通过命令行控制，无需修改配置文件。')
+    parser.add_argument('--noise-mode', type=str, choices=['by_bins', 'all_above_threshold'],
+                       default='by_bins',
+                       help='噪声注入策略：by_bins（按区间替换）或 all_above_threshold（整体替换超过阈值的样本）。')
+    parser.add_argument('--noise-threshold', type=float, default=0.4,
+                       help='高置信样本阈值（默认 0.4，仅当模式为 all_above_threshold 时使用）。')
+    parser.add_argument('--noise-pool', type=str, default='0.0-0.01',
+                       help='噪声样本池区间（默认 0.0-0.01，对应低一致性样本）。')
+    parser.add_argument('--noise-target-bins', type=str, default=None,
+                       help='模式为 by_bins 时使用，指定高置信区间列表，例如："0.4-0.6,0.6-0.8,0.8-1.0"。')
+    parser.add_argument('--noise-seed', type=int, default=None,
+                       help='噪声注入过程的随机种子，默认随机。')
 
     # 其他选项
     parser.add_argument('--check-status', action='store_true',
@@ -1242,7 +1606,12 @@ def main():
                 manager.run_noise_variants(
                     target_round=target_round,
                     noise_params=args.noise_params,
-                    variant_dir_prefix=args.variant_dir_prefix
+                    variant_dir_prefix=args.variant_dir_prefix,
+                    noise_mode=args.noise_mode,
+                    noise_threshold=args.noise_threshold,
+                    noise_pool=args.noise_pool,
+                    noise_target_bins=args.noise_target_bins,
+                    noise_seed=args.noise_seed
                 )
             elif args.scoring_fractions:
                 # 数据比例实验

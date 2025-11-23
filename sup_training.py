@@ -8,6 +8,7 @@ import json
 import random
 import itertools
 import hashlib
+import copy
 from tqdm import tqdm
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
@@ -568,8 +569,8 @@ def evaluate_model(model, data_loader, loss_fn, device, id_to_label: dict):
 CONFIG = {
     # 实验元信息
     'experiment_meta': {
-        'description': 'robert&bert_linear_experiment',  # 实验描述标识符
-        'experiment_name': 'roberta和bert在不同数据比例下线性评估结果',   # 实验的中文名称
+        'description': 'bert_linear_experiment',  # 实验描述标识符
+        'experiment_name': 'bert在不同数据比例下线性评估结果',   # 实验的中文名称
         'purpose': '跑roberta和bert在线性评估下的baseline',  # 实验目的
         'notes': '对齐实验配置',  # 实验备注
     },
@@ -584,24 +585,25 @@ CONFIG = {
         'use_fixed_split': True,    # 是否使用固定数量分割而非比例分割
         'train_samples_per_label': 500,  # 每个标签的训练样本数
         'val_samples_per_label': 200,    # 每个标签的验证样本数
+        'split_random_seed': 42,  # 数据划分的随机种子（控制哪些样本被选中）
     },
 
     # 模型配置
     'models': {
         # 'lora_bert_base_chinese_cl': 'model/google-bert_bert-base-chinese/best_contrastive_model.pth',
         # 'TextCNN_CL_bert': 'model/my_custom_textcnn_v3_bert_pruning_paircl/best_contrastive_model.pth',
-        'RoBERTa_base_chinese': 'iic/nlp_roberta_backbone_base_std',
+        # 'RoBERTa_base_chinese': 'iic/nlp_roberta_backbone_base_std',
         'Bert_base_chinese': 'google-bert/bert-base-chinese',
         # '0.75_round1_0.1_cl_bert' : 'iter_model/frac0.1_round1/best_model.pth'
     },
 
     # 超参数搜索空间
     'hyperparameters': {
-        'epochs': [50,100],                    # 训练轮数      [50,100]
+        'epochs': [10,30,50],                    # 训练轮数      [50,100]
         'batch_size':[16,32,64] ,              # 批次大小         [16,32,64,128]
-        'learning_rate': [1e-2,1e-3], # 学习率       [1e-3,1e-4]
-        'data_fractions': [1.0, 0.5, 0.2, 0.1, 0.05, 0.02],  # 数据使用比例       [1.0, 0.5, 0.2, 0.1, 0.05, 0.02]
-        'seeds': [42, 123, 456, 789, 101, 202, 303, 404, 505, 606],             # 随机种子
+        'learning_rate': [1e-1,1e-2,1e-3], # 学习率       [1e-3,1e-4]
+        'data_fractions': [1.0],  # 数据使用比例       [1.0, 0.5, 0.2, 0.1, 0.05, 0.02]
+        'seeds': [42],             # 随机种子 [123, 456, 789, 101, 202, 303, 404, 505, 606]
         'classifier_types': ['linear'], # 分类器类型
         'mlp_hidden_neurons': [512],  # MLP隐藏层神经元数量
         'freeze_encoder': [True],     # 是否冻结编码器
@@ -711,14 +713,16 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
                 print(f"  警告: 标签 '{label}' 只有 {len(label_data)} 条数据，需要 {required_total} 条")
                 print(f"   将使用所有可用数据，按原比例分割...")
                 # 如果数据不够，按原比例分割
+                split_seed = config['data'].get('split_random_seed', 42)
                 label_train, label_val = train_test_split(
                     label_data,
                     test_size=config['data']['validation_split'],
-                    random_state=42
+                    random_state=split_seed
                 )
             else:
-                # 固定种子随机采样
-                label_data_shuffled = label_data.sample(n=len(label_data), random_state=42).reset_index(drop=True)
+                # 使用可配置的随机种子进行采样
+                split_seed = config['data'].get('split_random_seed', 42)
+                label_data_shuffled = label_data.sample(n=len(label_data), random_state=split_seed).reset_index(drop=True)
 
                 # 按固定数量分割
                 label_train = label_data_shuffled[:config['data']['train_samples_per_label']]
@@ -734,10 +738,11 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
         print(f" 固定数量分割完成: 训练集 {len(df_train_prelim)} 条, 验证集 {len(df_val)} 条")
     else:
         print(" 使用比例分割，确保实验间数据一致性...")
+        split_seed = config['data'].get('split_random_seed', 42)
         df_train_prelim, df_val = train_test_split(
             df_train_full,
             test_size=config['data']['validation_split'],
-            random_state=42,  # 固定种子！所有实验使用相同的数据分割
+            random_state=split_seed,  # 使用可配置的种子
             stratify=df_train_full['label']
         )
 
@@ -829,27 +834,41 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
 
         best_val_f1 = -1
         best_model_state = None
+        best_val_metrics = None
+        best_train_loss = None
+        best_epoch = None
+        last_train_loss = None
 
         # 训练循环（缓存模式）
         for epoch in range(hyperparams['epochs']):
             print(f"  Epoch {epoch + 1}/{hyperparams['epochs']}")
             train_loss = train_epoch_cached(model, train_loader, loss_fn, optimizer, device, scheduler)
+            last_train_loss = train_loss
             val_metrics = evaluate_model_cached(model, val_loader, loss_fn, device, id_to_label)
             print(f"  训练损失: {train_loss:.4f} | 验证F1: {val_metrics['f1_score']:.4f} | 验证准确率: {val_metrics['accuracy']:.4f}")
 
             if val_metrics['f1_score'] > best_val_f1:
                 best_val_f1 = val_metrics['f1_score']
                 best_model_state = model.state_dict()
+                best_val_metrics = copy.deepcopy(val_metrics)
+                best_train_loss = train_loss
+                best_epoch = epoch + 1
                 print(f"   新的最佳验证F1分数: {best_val_f1:.4f}")
 
-        # 测试集评估（缓存模式）
+        # ✅ 只在训练集和验证集上评估，不触及测试集
         if best_model_state:
             model.load_state_dict(best_model_state)
-        print(" 使用最佳模型在测试集上进行最终评估...")
-        test_metrics = evaluate_model_cached(model, test_loader, loss_fn, device, id_to_label)
+        if best_val_metrics is None:
+            best_val_metrics = evaluate_model_cached(model, val_loader, loss_fn, device, id_to_label)
+        print(" 使用最佳模型在训练集上进行评估...")
+        train_metrics = evaluate_model_cached(model, train_loader, loss_fn, device, id_to_label)
+        if best_train_loss is None:
+            best_train_loss = last_train_loss
+        if best_epoch is None:
+            best_epoch = hyperparams['epochs']
 
-        #  新增: 保存最优模型
-        model_save_info = save_best_model_for_seed(model, best_model_state, hyperparams, best_val_f1, test_metrics, experiment_output_dir)
+        # ✅ 暂不保存模型，等待全局最优选择后再保存
+        # 这样可以节省磁盘空间，避免保存所有非最优超参数组合的模型
 
     else:
         print("\n 使用标准模式...")
@@ -886,55 +905,71 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
 
         best_val_f1 = -1
         best_model_state = None
+        best_val_metrics = None
+        best_train_loss = None
+        best_epoch = None
+        last_train_loss = None
 
         # 训练循环
         for epoch in range(hyperparams['epochs']):
             print(f"  Epoch {epoch + 1}/{hyperparams['epochs']}")
             train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device, scheduler)
+            last_train_loss = train_loss
             val_metrics = evaluate_model(model, val_loader, loss_fn, device, id_to_label)
             print(f"  训练损失: {train_loss:.4f} | 验证F1: {val_metrics['f1_score']:.4f} | 验证准确率: {val_metrics['accuracy']:.4f}")
 
             if val_metrics['f1_score'] > best_val_f1:
                 best_val_f1 = val_metrics['f1_score']
                 best_model_state = model.state_dict()
+                best_val_metrics = copy.deepcopy(val_metrics)
+                best_train_loss = train_loss
+                best_epoch = epoch + 1
                 print(f"   新的最佳验证F1分数: {best_val_f1:.4f}")
 
-        # 测试集评估
+        # ✅ 只在训练集和验证集上评估，不触及测试集
         if best_model_state:
             model.load_state_dict(best_model_state)
-        print(" 使用最佳模型在测试集上进行最终评估...")
-        test_metrics = evaluate_model(model, test_loader, loss_fn, device, id_to_label)
+        if best_val_metrics is None:
+            best_val_metrics = evaluate_model(model, val_loader, loss_fn, device, id_to_label)
+        print(" 使用最佳模型在训练集上进行评估...")
+        train_metrics = evaluate_model(model, train_loader, loss_fn, device, id_to_label)
+        if best_train_loss is None:
+            best_train_loss = last_train_loss
+        if best_epoch is None:
+            best_epoch = hyperparams['epochs']
 
-        #  新增: 保存最优模型
-        model_save_info = save_best_model_for_seed(model, best_model_state, hyperparams, best_val_f1, test_metrics, experiment_output_dir)
+        # ✅ 暂不保存模型，等待全局最优选择后再保存
+        # 这样可以节省磁盘空间，避免保存所有非最优超参数组合的模型
 
-    print(f"  测试集结果:")
-    print(f"    准确率: {test_metrics['accuracy']:.4f}")
-    print(f"    Macro精确率: {test_metrics['precision']:.4f}")
-    print(f"    Macro召回率: {test_metrics['recall']:.4f}")
-    print(f"    Macro F1分数: {test_metrics['f1_score']:.4f}")
-    print(f"    Micro F1分数: {test_metrics['f1_micro']:.4f} (验证: {'OK' if abs(test_metrics['f1_micro'] - test_metrics['accuracy']) < 0.001 else 'X'})")
+    print(f"  验证集最佳结果 (Epoch {best_epoch}):")
+    print(f"    验证集F1: {best_val_f1:.4f}")
+    print(f"    验证集准确率: {best_val_metrics['accuracy']:.4f}")
+    print(f"  ⚠️  测试集评估将在选出全局最优超参数后进行")
+    print(f"  ⚠️  模型将在选出全局最优后保存")
 
-    # 显示每个类别的详细指标
-    print(f"  各类别详细指标:")
-    for class_name, metrics in test_metrics['per_class_metrics'].items():
-        print(f"    {class_name}: P={metrics['precision']:.4f}, R={metrics['recall']:.4f}, F1={metrics['f1-score']:.4f}")
-
-    print(f"  说明: P=精确率, R=召回率, F1=F1分数")
-
-    # 添加超参数信息到结果中
+    # 添加超参数信息到结果中（不含测试集指标，不含model_save_path）
     result = {
         'hyperparameters': hyperparams,
-        'metrics': test_metrics,
+        'metrics': None,  # ✅ 测试集指标暂时为None
+        'metrics_train': train_metrics,
+        'metrics_val': best_val_metrics,
         'best_val_f1': best_val_f1,
+        'best_epoch': best_epoch,
+        'train_loss_at_best': best_train_loss,
         'used_cache': use_cache,
-        'model_save_path': model_save_info['model_path']  #  新增模型路径
+        'model_save_path': None,  # ✅ 暂时没有保存路径
+        'model_state_dict': best_model_state,  # ✅ 保存state_dict供后续保存和测试集评估
+        'test_loader': test_loader,  # ✅ 保存test_loader供后续评估
+        'loss_fn': loss_fn,  # ✅ 保存loss_fn
+        'device': device,  # ✅ 保存device
+        'id_to_label': id_to_label,  # ✅ 保存id_to_label
+        'use_cache': use_cache  # ✅ 标记是否使用缓存模式
     }
 
     return result
 
 def extract_best_results_by_model_and_fraction(results):
-    """提取每个模型在每个数据比例下的最优结果"""
+    """提取每个模型在每个数据比例下的最优结果（基于验证集F1）"""
     best_results = {}
 
     for result in results:
@@ -942,15 +977,15 @@ def extract_best_results_by_model_and_fraction(results):
             continue
 
         hyperparams = result['hyperparameters']
-        metrics = result['metrics']
+        # ✅ 改为基于验证集F1选择，与迭代接口保持一致
+        val_f1 = result.get('best_val_f1', float('-inf'))
 
         model_name = hyperparams['model_name']
         data_fraction = hyperparams['data_fraction']
-        f1_score = metrics['f1_score']
 
         key = (model_name, data_fraction)
 
-        if key not in best_results or f1_score > best_results[key]['metrics']['f1_score']:
+        if key not in best_results or val_f1 > best_results[key].get('best_val_f1', float('-inf')):
             best_results[key] = result
 
     return best_results
@@ -969,9 +1004,11 @@ def generate_model_comparison_analysis(best_results):
         if model_name not in comparison_data:
             comparison_data[model_name] = {}
 
+        # ✅ 安全地处理可能为None的测试集指标
+        test_metrics = result.get('metrics')
         comparison_data[model_name][data_fraction] = {
-            'metrics': result['metrics'],
-            'per_class_metrics': result['metrics'].get('per_class_metrics', {}),
+            'metrics': test_metrics,
+            'per_class_metrics': test_metrics.get('per_class_metrics', {}) if test_metrics else {},
             'hyperparams': result['hyperparameters'],
             'best_val_f1': result['best_val_f1']
         }
@@ -991,20 +1028,36 @@ def generate_model_comparison_analysis(best_results):
         for model in model_names:
             if model in comparison_data and fraction in comparison_data[model]:
                 model_result = comparison_data[model][fraction]
-                comparison_table['results'][fraction][model] = {
-                    'accuracy': round(model_result['metrics']['accuracy'], 4),
-                    'f1_score': round(model_result['metrics']['f1_score'], 4),
-                    'precision': round(model_result['metrics']['precision'], 4),
-                    'recall': round(model_result['metrics']['recall'], 4),
-                    'f1_micro': round(model_result['metrics'].get('f1_micro', 0), 4),
-                    'per_class_metrics': model_result['metrics'].get('per_class_metrics', {}),
-                    'best_hyperparams': {
-                        'learning_rate': model_result['hyperparams']['learning_rate'],
-                        'batch_size': model_result['hyperparams']['batch_size'],
-                        'epochs': model_result['hyperparams']['epochs'],
-                        'seed': model_result['hyperparams']['seed']
+                test_metrics = model_result['metrics']
+
+                # ✅ 只有当测试集指标存在时才添加
+                if test_metrics:
+                    comparison_table['results'][fraction][model] = {
+                        'accuracy': round(test_metrics['accuracy'], 4),
+                        'f1_score': round(test_metrics['f1_score'], 4),
+                        'precision': round(test_metrics['precision'], 4),
+                        'recall': round(test_metrics['recall'], 4),
+                        'f1_micro': round(test_metrics.get('f1_micro', 0), 4),
+                        'per_class_metrics': test_metrics.get('per_class_metrics', {}),
+                        'best_hyperparams': {
+                            'learning_rate': model_result['hyperparams']['learning_rate'],
+                            'batch_size': model_result['hyperparams']['batch_size'],
+                            'epochs': model_result['hyperparams']['epochs'],
+                            'seed': model_result['hyperparams']['seed']
+                        }
                     }
-                }
+                else:
+                    # 测试集指标尚未评估
+                    comparison_table['results'][fraction][model] = {
+                        'note': '测试集指标尚未评估',
+                        'validation_f1': model_result['best_val_f1'],
+                        'best_hyperparams': {
+                            'learning_rate': model_result['hyperparams']['learning_rate'],
+                            'batch_size': model_result['hyperparams']['batch_size'],
+                            'epochs': model_result['hyperparams']['epochs'],
+                            'seed': model_result['hyperparams']['seed']
+                        }
+                    }
             else:
                 comparison_table['results'][fraction][model] = None
 
@@ -1024,16 +1077,24 @@ def group_results_by_model_fraction(results):
         if key not in grouped:
             grouped[key] = []
 
+        # ✅ 安全地处理可能为None的测试集指标和模型路径
+        test_metrics = result.get('metrics')
+        model_path = result.get('model_save_path')
         grouped[key].append({
             'seed': hyperparams['seed'],
-            'test_f1': result['metrics']['f1_score'],
-            'test_accuracy': result['metrics']['accuracy'],
-            'test_precision': result['metrics']['precision'],
-            'test_recall': result['metrics']['recall'],
-            'test_f1_micro': result['metrics'].get('f1_micro', 0),
-            'per_class_metrics': result['metrics'].get('per_class_metrics', {}),
+            'test_f1': test_metrics['f1_score'] if test_metrics else None,
+            'test_accuracy': test_metrics['accuracy'] if test_metrics else None,
+            'test_precision': test_metrics['precision'] if test_metrics else None,
+            'test_recall': test_metrics['recall'] if test_metrics else None,
+            'test_f1_micro': test_metrics.get('f1_micro', 0) if test_metrics else None,
+            'test_metrics': test_metrics,
+            'train_metrics': result.get('metrics_train'),
+            'val_metrics': result.get('metrics_val'),
+            'per_class_metrics': test_metrics.get('per_class_metrics', {}) if test_metrics else {},
             'val_f1': result['best_val_f1'],
-            'model_path': result['model_save_path'],
+            'best_epoch': result.get('best_epoch'),
+            'train_loss_at_best': result.get('train_loss_at_best'),
+            'model_path': model_path,  # ✅ 只有全局最优模型有路径，其余为None
             'hyperparameters': hyperparams
         })
 
@@ -1095,8 +1156,23 @@ def save_experiment_results(results, config, output_dir=None):
                 f"seed{hyperparams['seed']}.json"
             )
             filepath = os.path.join(detailed_results_dir, filename)
+
+            # ✅ 创建JSON可序列化的副本（移除state_dict等不可序列化对象）
+            result_for_json = {
+                'hyperparameters': result['hyperparameters'],
+                'metrics': result.get('metrics'),
+                'metrics_train': result.get('metrics_train'),
+                'metrics_val': result.get('metrics_val'),
+                'best_val_f1': result.get('best_val_f1'),
+                'best_epoch': result.get('best_epoch'),
+                'train_loss_at_best': result.get('train_loss_at_best'),
+                'used_cache': result.get('used_cache'),
+                'model_save_path': result.get('model_save_path'),
+                # 不保存: model_state_dict, test_loader, loss_fn, device, id_to_label
+            }
+
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=4)
+                json.dump(result_for_json, f, ensure_ascii=False, indent=4)
 
         print(f" 详细结果已保存到: {detailed_results_dir}")
 
@@ -1125,18 +1201,29 @@ def save_experiment_results(results, config, output_dir=None):
     for (model_name, data_fraction), result in best_results.items():
         if model_name not in best_hyperparams:
             best_hyperparams[model_name] = {}
-        best_hyperparams[model_name][data_fraction] = {
-            'hyperparameters': result['hyperparameters'],
-            'performance': {
-                'f1_score': result['metrics']['f1_score'],
-                'accuracy': result['metrics']['accuracy'],
-                'precision': result['metrics']['precision'],
-                'recall': result['metrics']['recall'],
-                'f1_micro': result['metrics'].get('f1_micro', 0)
-            },
-            'per_class_metrics': result['metrics'].get('per_class_metrics', {}),
-            'validation_f1': result['best_val_f1']
-        }
+
+        # ✅ 安全地处理可能为None的测试集指标
+        test_metrics = result.get('metrics')
+        if test_metrics:
+            best_hyperparams[model_name][data_fraction] = {
+                'hyperparameters': result['hyperparameters'],
+                'performance': {
+                    'f1_score': test_metrics['f1_score'],
+                    'accuracy': test_metrics['accuracy'],
+                    'precision': test_metrics['precision'],
+                    'recall': test_metrics['recall'],
+                    'f1_micro': test_metrics.get('f1_micro', 0)
+                },
+                'per_class_metrics': test_metrics.get('per_class_metrics', {}),
+                'validation_f1': result['best_val_f1']
+            }
+        else:
+            # 如果测试集指标不可用，只保存验证集信息
+            best_hyperparams[model_name][data_fraction] = {
+                'hyperparameters': result['hyperparameters'],
+                'performance': None,  # 测试集指标尚未评估
+                'validation_f1': result['best_val_f1']
+            }
 
     best_hyperparams_path = os.path.join(best_results_dir, 'best_hyperparams_by_model.json')
     with open(best_hyperparams_path, 'w', encoding='utf-8') as f:
@@ -1154,25 +1241,38 @@ def save_experiment_results(results, config, output_dir=None):
         'performance_trends': {}
     }
 
-    # 找出每个指标的全局最优结果
-    for metric in ['accuracy', 'f1_score', 'precision', 'recall']:
-        best_result = max(best_results.values(), key=lambda x: x['metrics'][metric])
-        performance_analysis['best_overall_performance'][metric] = {
-            'value': best_result['metrics'][metric],
-            'model': best_result['hyperparameters']['model_name'],
-            'data_fraction': best_result['hyperparameters']['data_fraction'],
-            'hyperparameters': best_result['hyperparameters'],
-            'per_class_metrics': best_result['metrics'].get('per_class_metrics', {})
-        }
+    # ✅ 只有当所有结果都有测试集指标时才生成性能分析
+    all_have_test_metrics = all(r.get('metrics') is not None for r in best_results.values())
 
-    # 分析性能趋势
-    for model_name in performance_analysis['summary']['models_tested']:
-        model_results = [(fraction, result) for (model, fraction), result in best_results.items() if model == model_name]
-        model_results.sort(key=lambda x: x[0], reverse=True)  # 按数据比例降序排列
+    if all_have_test_metrics:
+        # 找出每个指标的全局最优结果
+        for metric in ['accuracy', 'f1_score', 'precision', 'recall']:
+            best_result = max(best_results.values(), key=lambda x: x['metrics'][metric])
+            performance_analysis['best_overall_performance'][metric] = {
+                'value': best_result['metrics'][metric],
+                'model': best_result['hyperparameters']['model_name'],
+                'data_fraction': best_result['hyperparameters']['data_fraction'],
+                'hyperparameters': best_result['hyperparameters'],
+                'per_class_metrics': best_result['metrics'].get('per_class_metrics', {})
+            }
 
-        performance_analysis['performance_trends'][model_name] = {
-            'f1_scores_by_fraction': [(fraction, result['metrics']['f1_score']) for fraction, result in model_results],
-            'accuracy_by_fraction': [(fraction, result['metrics']['accuracy']) for fraction, result in model_results]
+        # 分析性能趋势
+        for model_name in performance_analysis['summary']['models_tested']:
+            model_results = [(fraction, result) for (model, fraction), result in best_results.items() if model == model_name]
+            model_results.sort(key=lambda x: x[0], reverse=True)  # 按数据比例降序排列
+
+            performance_analysis['performance_trends'][model_name] = {
+                'f1_scores_by_fraction': [(fraction, result['metrics']['f1_score']) for fraction, result in model_results],
+                'accuracy_by_fraction': [(fraction, result['metrics']['accuracy']) for fraction, result in model_results]
+            }
+    else:
+        performance_analysis['note'] = '测试集指标尚未全部评估，性能分析基于验证集'
+        # 基于验证集生成简化的分析
+        best_val_result = max(best_results.values(), key=lambda x: x['best_val_f1'])
+        performance_analysis['best_validation_performance'] = {
+            'validation_f1': best_val_result['best_val_f1'],
+            'model': best_val_result['hyperparameters']['model_name'],
+            'data_fraction': best_val_result['hyperparameters']['data_fraction']
         }
 
     performance_analysis_path = os.path.join(best_results_dir, 'performance_analysis.json')
@@ -1181,15 +1281,23 @@ def save_experiment_results(results, config, output_dir=None):
     print(f" 性能分析报告已保存到: {performance_analysis_path}")
 
     # 传统的聚合结果分析 - 保存到详细结果文件夹
+    # ⚠️  注意：此聚合分析只包含有测试集指标的结果（即全局最优的超参数组合）
     if config['experiment']['aggregate_results']:
         print(" 生成传统聚合分析...")
         aggregate_results = {}
+        skipped_count = 0  # 记录跳过的结果数量
+
         for result in results:
             if result is None:
                 continue
 
             hyperparams = result['hyperparameters']
-            metrics = result['metrics']
+            metrics = result.get('metrics')  # ✅ 使用 get() 避免 KeyError
+
+            # ✅ 跳过没有测试集指标的结果（只有全局最优有测试集指标）
+            if metrics is None:
+                skipped_count += 1
+                continue
 
             # 创建配置键
             config_key = (
@@ -1246,7 +1354,12 @@ def save_experiment_results(results, config, output_dir=None):
         summary_filepath = os.path.join(detailed_results_dir, 'hyperparameter_search_summary.json')
         with open(summary_filepath, 'w', encoding='utf-8') as f:
             json.dump(summary_results, f, ensure_ascii=False, indent=4)
-        print(f" 传统聚合结果已保存到: {summary_filepath}")
+
+        if skipped_count > 0:
+            print(f" 传统聚合结果已保存到: {summary_filepath}")
+            print(f"   (注意: 跳过了 {skipped_count} 个没有测试集指标的结果，只包含全局最优的配置)")
+        else:
+            print(f" 传统聚合结果已保存到: {summary_filepath}")
 
     print(f"\n 所有结果已保存到: {output_dir}")
     print(f"    最优结果对比: {best_results_dir}")
@@ -1257,7 +1370,7 @@ def save_experiment_results(results, config, output_dir=None):
 
 # --- 6. 主函数 ---
 
-def run_supervised_training_interface(encoder_path: str, config: dict, output_dir: str, round_num: int = None) -> str:
+def run_supervised_training_interface(encoder_path: str, config: dict, output_dir: str, round_num: int = None) -> dict:
     """
     标准化接口：运行监督学习超参数搜索
 
@@ -1267,7 +1380,7 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
         output_dir: 输出目录
 
     Returns:
-        实验结果目录路径
+        包含最佳模型路径、实验目录及关键指标的字典
     """
     import os
     import copy
@@ -1278,9 +1391,11 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
     if round_num:
         print(f"   实验轮次: 第{round_num}轮")
 
+    global CONFIG
+    original_config = CONFIG
+
     try:
         # 复制全局CONFIG并修改
-        global CONFIG
         config_copy = copy.deepcopy(CONFIG)
 
         # 更新配置
@@ -1298,6 +1413,16 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
         if 'test_data_path' in config:
             config_copy['data']['test_data_path'] = config['test_data_path']
 
+        # ✅ 新增：固定分割相关参数
+        if 'use_fixed_split' in config:
+            config_copy['data']['use_fixed_split'] = config['use_fixed_split']
+        if 'train_samples_per_label' in config:
+            config_copy['data']['train_samples_per_label'] = config['train_samples_per_label']
+        if 'val_samples_per_label' in config:
+            config_copy['data']['val_samples_per_label'] = config['val_samples_per_label']
+        if 'split_random_seed' in config:
+            config_copy['data']['split_random_seed'] = config['split_random_seed']
+
         # 更新超参数
         if 'data_fractions' in config:
             config_copy['hyperparameters']['data_fractions'] = config['data_fractions']
@@ -1312,8 +1437,14 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
                 config_copy['hyperparameters']['learning_rate'] = [float(x) for x in lr]
             else:
                 config_copy['hyperparameters']['learning_rate'] = [float(lr)]
+        # ✅ 单种子模式（迭代训练专用）
         if 'seeds' in config:
             config_copy['hyperparameters']['seeds'] = config['seeds']
+        else:
+            # 默认使用单种子
+            config_copy['hyperparameters']['seeds'] = [42]
+            print(f"   [迭代模式] 使用单种子: 42")
+
         if 'classifier_types' in config:
             config_copy['hyperparameters']['classifier_types'] = config['classifier_types']
         if 'mlp_hidden_neurons' in config:
@@ -1338,18 +1469,128 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
             result = run_single_experiment(CONFIG, hyperparams, output_dir, round_num)
             all_results.append(result)
 
-        # 保存结果 - 使用传入的output_dir而不是CONFIG中的base_output_dir
+        # ✅ 关键修改：基于验证集F1选择最优模型（而非测试集F1均值）
+        print(f"\n   [迭代模式] 基于验证集F1选择最优模型...")
+        best_run = None
+        best_val_f1 = float('-inf')
+
+        for run in all_results:
+            if run is None:
+                continue
+            val_f1 = run.get('best_val_f1', float('-inf'))
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_run = run
+
+        if not best_run:
+            raise RuntimeError("未获得有效的监督学习结果供迭代流程使用")
+
+        # ✅ 只对最优模型评估测试集（避免数据泄漏）
+        print(f"\n   [测试集评估] 只对最优超参数配置评估测试集...")
+        print(f"   最佳超参数: epoch={best_run['hyperparameters']['epochs']}, "
+              f"lr={best_run['hyperparameters']['learning_rate']}, "
+              f"bs={best_run['hyperparameters']['batch_size']}, "
+              f"frac={best_run['hyperparameters']['data_fraction']}")
+        print(f"   验证集F1: {best_val_f1:.4f}")
+
+        # 加载最佳模型并在测试集上评估
+        device = best_run['device']
+        test_loader = best_run['test_loader']
+        loss_fn = best_run['loss_fn']
+        id_to_label = best_run['id_to_label']
+        use_cache = best_run['use_cache']
+
+        # 重建模型结构
+        if use_cache:
+            # 缓存模式 - 需要推断编码器输出维度
+            # 根据分类器类型选择正确的权重键名
+            classifier_type = best_run['hyperparameters']['classifier_type']
+            state_dict = best_run['model_state_dict']
+
+            if classifier_type == 'linear':
+                # Linear分类器: classifier.weight 的shape是 [num_labels, encoder_output_dim]
+                encoder_output_dim = state_dict['classifier.weight'].shape[1]
+            elif classifier_type == 'mlp':
+                # MLP分类器: classifier.0.weight 的shape是 [mlp_hidden_neurons, encoder_output_dim]
+                encoder_output_dim = state_dict['classifier.0.weight'].shape[1]
+            else:
+                raise ValueError(f"未知的分类器类型: {classifier_type}")
+
+            test_model = CachedSupervisedModel(
+                encoder_output_dim=encoder_output_dim,
+                num_labels=len(id_to_label),
+                classifier_type=classifier_type,
+                mlp_hidden_neurons=best_run['hyperparameters'].get('mlp_hidden_neurons', 384)
+            ).to(device)
+        else:
+            # 标准模式 - 需要重新加载编码器
+            base_encoder, _, _ = load_pretrained_encoder(best_run['hyperparameters']['checkpoint_path'])
+            test_model = SupervisedModel(
+                base_encoder=base_encoder,
+                num_labels=len(id_to_label),
+                classifier_type=best_run['hyperparameters']['classifier_type'],
+                mlp_hidden_neurons=best_run['hyperparameters'].get('mlp_hidden_neurons', 384)
+            ).to(device)
+
+        # 加载最佳权重
+        test_model.load_state_dict(best_run['model_state_dict'])
+
+        # 评估测试集
+        if use_cache:
+            test_metrics = evaluate_model_cached(test_model, test_loader, loss_fn, device, id_to_label)
+        else:
+            test_metrics = evaluate_model(test_model, test_loader, loss_fn, device, id_to_label)
+
+        print(f"\n   [测试集结果]:")
+        print(f"    准确率: {test_metrics['accuracy']:.4f}")
+        print(f"    Macro F1: {test_metrics['f1_score']:.4f}")
+        print(f"    Macro 精确率: {test_metrics['precision']:.4f}")
+        print(f"    Macro 召回率: {test_metrics['recall']:.4f}")
+
+        # 更新best_run的测试集指标
+        best_run['metrics'] = test_metrics
+
+        # ✅ 只保存最优模型一次（包含完整的测试集指标）
+        print(f"\n   [保存最优模型] 保存全局最优超参数的模型...")
+        model_save_info = save_best_model_for_seed(
+            test_model, best_run['model_state_dict'],
+            best_run['hyperparameters'], best_val_f1,
+            test_metrics, output_dir
+        )
+        best_model_path = model_save_info['model_path']
+        best_run['model_save_path'] = best_model_path  # ✅ 更新保存路径
+
+        print(f"   最优模型已保存到: {best_model_path}")
+
+        # 保存结果 - 现在all_results中的best_run包含了测试集指标
         experiment_dir = save_experiment_results(all_results, CONFIG, output_dir)
 
-        # 恢复原始配置
-        CONFIG = original_config
+        # ✅ 返回完整的train/dev/test指标
+        interface_payload = {
+            'experiment_dir': experiment_dir,
+            'best_model_path': best_model_path,
+            'metrics': {
+                'train': best_run.get('metrics_train'),
+                'dev': best_run.get('metrics_val'),
+                'test': test_metrics
+            },
+            'best_epoch': best_run.get('best_epoch'),
+            'train_loss_at_best': best_run.get('train_loss_at_best'),
+            'hyperparameters': best_run.get('hyperparameters'),
+            'used_cache': best_run.get('used_cache', False),
+            'best_val_f1': best_val_f1  # ✅ 新增验证集F1
+        }
 
-        print(f" 监督学习完成，结果保存在: {experiment_dir}")
-        return experiment_dir
+        print(f"\n   监督学习完成，结果保存在: {experiment_dir}")
+        print(f"   最佳模型: {best_model_path}")
+
+        return interface_payload
 
     except Exception as e:
         print(f" 监督学习失败: {e}")
         raise
+    finally:
+        CONFIG = original_config
 
 
 if __name__ == '__main__':
@@ -1382,15 +1623,110 @@ if __name__ == '__main__':
         # 可选：每完成几个实验就保存一次中间结果
         if (i + 1) % 10 == 0:
             print(f"\n 保存中间结果... (已完成 {i+1}/{len(combinations)} 个实验)")
+            # 注意：中间结果保存时，测试集指标为None
             experiment_dir = save_experiment_results(all_results, CONFIG)
 
-    # 保存最终结果
+    # ✅ 选择全局最优模型并评估测试集
+    print(f"\n{'='*80}")
+    print(" 选择全局最优模型...")
+    print(f"{'='*80}")
+
+    best_run = None
+    best_val_f1 = float('-inf')
+
+    for run in all_results:
+        if run is None:
+            continue
+        val_f1 = run.get('best_val_f1', float('-inf'))
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_run = run
+
+    if best_run:
+        print(f"\n ✅ 找到全局最优模型:")
+        print(f"    验证集F1: {best_val_f1:.4f}")
+        print(f"    最佳超参数: epoch={best_run['hyperparameters']['epochs']}, "
+              f"lr={best_run['hyperparameters']['learning_rate']}, "
+              f"bs={best_run['hyperparameters']['batch_size']}, "
+              f"frac={best_run['hyperparameters']['data_fraction']}, "
+              f"seed={best_run['hyperparameters']['seed']}")
+
+        # 重建模型并评估测试集
+        device = best_run['device']
+        test_loader = best_run['test_loader']
+        loss_fn = best_run['loss_fn']
+        id_to_label = best_run['id_to_label']
+        use_cache = best_run['use_cache']
+
+        print(f"\n 重建模型并评估测试集...")
+        if use_cache:
+            # 缓存模式 - 需要推断编码器输出维度
+            # 根据分类器类型选择正确的权重键名
+            classifier_type = best_run['hyperparameters']['classifier_type']
+            state_dict = best_run['model_state_dict']
+
+            if classifier_type == 'linear':
+                # Linear分类器: classifier.weight 的shape是 [num_labels, encoder_output_dim]
+                encoder_output_dim = state_dict['classifier.weight'].shape[1]
+            elif classifier_type == 'mlp':
+                # MLP分类器: classifier.0.weight 的shape是 [mlp_hidden_neurons, encoder_output_dim]
+                encoder_output_dim = state_dict['classifier.0.weight'].shape[1]
+            else:
+                raise ValueError(f"未知的分类器类型: {classifier_type}")
+
+            test_model = CachedSupervisedModel(
+                encoder_output_dim=encoder_output_dim,
+                num_labels=len(id_to_label),
+                classifier_type=classifier_type,
+                mlp_hidden_neurons=best_run['hyperparameters'].get('mlp_hidden_neurons', 384)
+            ).to(device)
+        else:
+            base_encoder, _, _ = load_pretrained_encoder(best_run['hyperparameters']['checkpoint_path'])
+            test_model = SupervisedModel(
+                base_encoder=base_encoder,
+                num_labels=len(id_to_label),
+                classifier_type=best_run['hyperparameters']['classifier_type'],
+                mlp_hidden_neurons=best_run['hyperparameters'].get('mlp_hidden_neurons', 384)
+            ).to(device)
+
+        test_model.load_state_dict(best_run['model_state_dict'])
+
+        # 评估测试集
+        if use_cache:
+            test_metrics = evaluate_model_cached(test_model, test_loader, loss_fn, device, id_to_label)
+        else:
+            test_metrics = evaluate_model(test_model, test_loader, loss_fn, device, id_to_label)
+
+        print(f"\n ✅ 测试集结果:")
+        print(f"    准确率: {test_metrics['accuracy']:.4f}")
+        print(f"    Macro F1: {test_metrics['f1_score']:.4f}")
+        print(f"    Macro 精确率: {test_metrics['precision']:.4f}")
+        print(f"    Macro 召回率: {test_metrics['recall']:.4f}")
+
+        # 更新best_run的测试集指标
+        best_run['metrics'] = test_metrics
+
+        # 保存最优模型
+        print(f"\n 保存全局最优模型...")
+        model_save_info = save_best_model_for_seed(
+            test_model, best_run['model_state_dict'],
+            best_run['hyperparameters'], best_val_f1,
+            test_metrics, experiment_output_dir
+        )
+        best_run['model_save_path'] = model_save_info['model_path']
+        print(f" 最优模型已保存到: {model_save_info['model_path']}")
+    else:
+        print(f"\n ⚠️  未找到有效的实验结果")
+
+    # 保存最终结果（包含测试集指标）
     print(f"\n 保存最终实验结果...")
     experiment_dir = save_experiment_results(all_results, CONFIG)
 
     print(f"\n 所有超参数搜索实验已完成！")
     print(f" 结果保存在: {experiment_dir}")
     print(f" 实验描述: {CONFIG['experiment_meta']['description']}")
+    if best_run and best_run.get('model_save_path'):
+        print(f" 最优模型: {best_run['model_save_path']}")
 
 # --- 其他实验配置示例 ---
 

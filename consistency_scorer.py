@@ -11,6 +11,9 @@ from typing import Dict, List, Tuple, Optional
 import argparse
 from datetime import datetime
 import logging
+import random
+import math
+from copy import deepcopy
 
 # 导入必要的模块
 from sup_training import SupervisedModel, SupervisedTextDataset, load_pretrained_encoder
@@ -342,6 +345,10 @@ class ConsistencyScorer:
                 # 转换到0-1范围
                 consistency = (consistency + 1) / 2
 
+        elif method == 'simple_dot_product':
+            # 纯点积方法: Q = p^T × q
+            consistency = np.dot(anchor_prob, positive_prob)
+
         elif method == 'prediction_agreement':
             # 预测标签是否一致
             anchor_pred = np.argmax(anchor_prob)
@@ -392,7 +399,8 @@ class ConsistencyScorer:
 
     def score_dataset_pairs(self, dataset_path: str, method: str = 'confidence_weighted_dot_product',
                            max_pairs: Optional[int] = None, batch_size: int = 32,
-                           save_enhanced_dataset: bool = True) -> Dict:
+                           save_enhanced_dataset: bool = True,
+                           noise_config: Optional[Dict] = None) -> Dict:
         """
         为数据集中的所有正样本对计算一致性得分，并保存增强数据集
 
@@ -571,7 +579,7 @@ class ConsistencyScorer:
 
         print(f" 计算一致性得分...")
 
-        if method in ['confidence_weighted_dot_product', 'kl_divergence', 'cosine_similarity']:
+        if method in ['confidence_weighted_dot_product', 'kl_divergence', 'cosine_similarity', 'simple_dot_product']:
             # 批量处理方法
             all_anchor_texts = [pair[0] for pair in pairs]
             all_positive_texts = [pair[1] for pair in pairs]
@@ -609,6 +617,10 @@ class ConsistencyScorer:
                         confidence_positive = 1 - normalized_entropy_positive
 
                         consistency = dot_product * confidence_anchor * confidence_positive
+
+                    elif method == 'simple_dot_product':
+                        # 纯点积方法
+                        consistency = np.dot(anchor_prob, positive_prob)
 
                     elif method == 'kl_divergence':
                         epsilon = 1e-8
@@ -651,6 +663,67 @@ class ConsistencyScorer:
                     pair_info[i]['consistency_score'] = float(consistency)
 
         # 计算统计信息
+        noise_summary = None
+        noise_eval_dataset_path = None
+        if noise_config and noise_config.get('enabled', False):
+            apply_to_dataset = bool(noise_config.get('apply_to_dataset', True))
+            original_pairs = list(pairs)
+            original_pair_info = [deepcopy(info) for info in pair_info]
+            original_scores = list(consistency_scores)
+            original_anchor_probs = np.copy(anchor_probs_all) if isinstance(anchor_probs_all, np.ndarray) else anchor_probs_all
+            original_positive_probs = np.copy(positive_probs_all) if isinstance(positive_probs_all, np.ndarray) else positive_probs_all
+            try:
+                noisy_pairs, noisy_pair_info, noisy_scores, noisy_anchor_probs, noisy_positive_probs, noise_summary = \
+                    self._apply_noise_injection(
+                        pairs=pairs,
+                        pair_info=pair_info,
+                        consistency_scores=consistency_scores,
+                        anchor_probs=anchor_probs_all,
+                        positive_probs=positive_probs_all,
+                        noise_config=noise_config
+                    )
+                if noise_summary is not None:
+                    noise_summary['applied_to_dataset'] = apply_to_dataset
+                if apply_to_dataset:
+                    pairs = noisy_pairs
+                    pair_info = noisy_pair_info
+                    consistency_scores = noisy_scores
+                    anchor_probs_all = noisy_anchor_probs
+                    positive_probs_all = noisy_positive_probs
+                else:
+                    output_dir_for_noise = getattr(self, '_current_output_dir', '.')
+                    if noise_summary and noise_summary.get('status') == 'applied' and noisy_pairs:
+                        noise_metadata = dict(noise_summary)
+                        noise_metadata['applied_to_dataset'] = False
+                        noise_eval_dataset_path = self._save_enhanced_dataset(
+                            original_dataset_path=dataset_path,
+                            pairs=noisy_pairs,
+                            pair_info=noisy_pair_info,
+                            consistency_scores=noisy_scores,
+                            anchor_probs=noisy_anchor_probs,
+                            positive_probs=noisy_positive_probs,
+                            method=method,
+                            output_dir=output_dir_for_noise,
+                            filename_suffix="noise_eval",
+                            noise_summary=noise_metadata
+                        )
+                    pairs = original_pairs
+                    pair_info = original_pair_info
+                    consistency_scores = original_scores
+                    anchor_probs_all = original_anchor_probs
+                    positive_probs_all = original_positive_probs
+                    if noise_summary is not None:
+                        noise_summary['applied_to_dataset'] = False
+                        if noise_eval_dataset_path:
+                            noise_summary['evaluation_dataset_path'] = noise_eval_dataset_path
+            except Exception as noise_ex:
+                print(f" [璀﹀憡] 噪声注入失败: {noise_ex}")
+                noise_summary = {
+                    'enabled': True,
+                    'status': 'failed',
+                    'error': str(noise_ex)
+                }
+
         scores_array = np.array(consistency_scores)
         statistics = {
             'count': len(consistency_scores),
@@ -681,11 +754,13 @@ class ConsistencyScorer:
             enhanced_dataset_path = self._save_enhanced_dataset(
                 original_dataset_path=dataset_path,
                 pairs=pairs,
+                pair_info=pair_info,
                 consistency_scores=consistency_scores,
                 anchor_probs=anchor_probs_all,
                 positive_probs=positive_probs_all,
                 method=method,
-                output_dir=output_dir
+                output_dir=output_dir,
+                noise_summary=noise_summary
             )
 
         return {
@@ -695,7 +770,12 @@ class ConsistencyScorer:
             'method': method,
             'dataset_path': dataset_path,
             'enhanced_dataset_path': enhanced_dataset_path,  #  新增
+            'noise_evaluation_dataset_path': noise_eval_dataset_path,
             'model_path': self.model_path,
+            'noise_injection': noise_summary if noise_summary else {
+                'enabled': bool(noise_config and noise_config.get('enabled', False)),
+                'status': 'skipped'
+            },
             'timestamp': datetime.now().isoformat(),
             # 移除不可靠的推荐模型逻辑
         }
@@ -807,9 +887,211 @@ class ConsistencyScorer:
 
         return csv_path
 
+    def _apply_noise_injection(self, pairs: List[Tuple[str, str]], pair_info: List[dict],
+                              consistency_scores: List[float],
+                              anchor_probs: Optional[np.ndarray],
+                              positive_probs: Optional[np.ndarray],
+                              noise_config: Dict) -> Tuple[List[Tuple[str, str]], List[dict],
+                                                            List[float], Optional[np.ndarray],
+                                                            Optional[np.ndarray], Dict]:
+        """
+        鎵ц闄勫姞鍔犲櫔鐨勬暟鎹搷浣滐紝灏嗘暟鎹粨鏋滀腑鐨勪竴閬撳垎閲忓悇鍖洪棿鏍锋湰鍙樻崲涓哄皝瑁呮暟鎹?
+        """
+        config = dict(noise_config)
+        fraction = float(config.get('fraction', 0.0))
+        if fraction <= 0:
+            return pairs, pair_info, consistency_scores, anchor_probs, positive_probs, {
+                'enabled': True,
+                'status': 'skipped_fraction_0'
+            }
+
+        threshold = float(config.get('threshold', 0.4))
+        mode = config.get('mode', 'by_bins')
+        seed = config.get('seed')
+        rng = random.Random(seed)
+
+        def _parse_range(value, default):
+            if isinstance(value, (list, tuple)) and len(value) == 2:
+                try:
+                    return float(value[0]), float(value[1])
+                except (TypeError, ValueError):
+                    return default
+            if isinstance(value, str):
+                cleaned = value.replace('[', '').replace(']', '').strip()
+                delimiter = '-' if '-' in cleaned else ','
+                parts = [p.strip() for p in cleaned.split(delimiter) if p.strip()]
+                if len(parts) == 2:
+                    try:
+                        return float(parts[0]), float(parts[1])
+                    except ValueError:
+                        return default
+            return default
+
+        def _parse_bins(value, default):
+            if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+                try:
+                    return [(float(v[0]), float(v[1])) for v in value]
+                except (TypeError, ValueError):
+                    return default
+            if isinstance(value, str):
+                chunks = [c.strip() for c in value.split(',') if c.strip()]
+                parsed = []
+                for chunk in chunks:
+                    rng_range = _parse_range(chunk, None)
+                    if rng_range:
+                        parsed.append(rng_range)
+                if parsed:
+                    return parsed
+            return default
+
+        noise_range = _parse_range(config.get('noise_pool', (0.0, 0.01)), (0.0, 0.01))
+        default_bins = [(threshold, 0.6), (0.6, 0.8), (0.8, 1.0)]
+        target_bins = _parse_bins(config.get('target_bins', default_bins), default_bins)
+
+        scores_array = np.array(consistency_scores, dtype=float)
+        noise_mask = (scores_array >= noise_range[0]) & (scores_array <= (noise_range[1] + 1e-8))
+        noise_indices = np.where(noise_mask)[0].tolist()
+
+        if not noise_indices:
+            print(f" [璀﹀憡] 噪声注入跳过: 无噪声池样本，区间 {noise_range}")
+            return pairs, pair_info, consistency_scores, anchor_probs, positive_probs, {
+                'enabled': True,
+                'status': 'skipped_empty_pool',
+                'noise_pool': list(noise_range)
+            }
+
+        target_groups: List[Dict] = []
+        if mode == 'all_above_threshold':
+            indices = np.where(scores_array >= threshold)[0].tolist()
+            target_groups.append({
+                'name': f'>={threshold:.2f}',
+                'indices': indices,
+                'fraction': fraction
+            })
+        else:
+            for lower, upper in target_bins:
+                if lower is None or upper is None:
+                    continue
+                mask = (scores_array >= lower) & (scores_array < (upper + (1e-8 if upper == 1.0 else 0)))
+                indices = np.where(mask)[0].tolist()
+                target_groups.append({
+                    'name': f'{lower:.2f}-{upper:.2f}',
+                    'indices': indices,
+                    'fraction': fraction
+                })
+
+        if not target_groups:
+            print(" [璀﹀憡] 噪声注入跳过: 无可替换的目标区间")
+            return pairs, pair_info, consistency_scores, anchor_probs, positive_probs, {
+                'enabled': True,
+                'status': 'skipped_empty_targets'
+            }
+
+        pairs = list(pairs)
+        pair_info = list(pair_info)
+        replacements = []
+        available_noise = noise_indices.copy()
+
+        def _take_noise_sample():
+            nonlocal available_noise
+            if not available_noise:
+                available_noise = noise_indices.copy()
+            pick = rng.choice(available_noise)
+            available_noise.remove(pick)
+            return pick
+
+        for group in target_groups:
+            indices = group['indices']
+            if not indices:
+                continue
+
+            replace_count = math.ceil(len(indices) * group['fraction'])
+            if replace_count <= 0:
+                continue
+            replace_count = min(replace_count, len(indices))
+
+            selected_targets = rng.sample(indices, replace_count) if replace_count < len(indices) else list(indices)
+
+            for target_idx in selected_targets:
+                noise_idx = _take_noise_sample()
+
+                original_score = float(scores_array[target_idx])
+                noise_score = float(scores_array[noise_idx])
+
+                pairs[target_idx] = pairs[noise_idx]
+
+                if 0 <= noise_idx < len(pair_info):
+                    new_info = deepcopy(pair_info[noise_idx])
+                else:
+                    new_info = {}
+
+                new_info['noise_injected'] = True
+                new_info['noise_original_score'] = original_score
+                new_info['noise_replacement_score'] = noise_score
+                new_info['noise_source_index'] = int(noise_idx)
+                new_info['noise_group'] = group['name']
+
+                if target_idx < len(pair_info):
+                    pair_info[target_idx] = new_info
+                else:
+                    pair_info.append(new_info)
+
+                if anchor_probs is not None and len(anchor_probs) > noise_idx:
+                    if len(anchor_probs) <= target_idx:
+                        anchor_probs = np.vstack([anchor_probs, anchor_probs[noise_idx]])
+                    anchor_probs[target_idx] = anchor_probs[noise_idx]
+
+                if positive_probs is not None and len(positive_probs) > noise_idx:
+                    if len(positive_probs) <= target_idx:
+                        positive_probs = np.vstack([positive_probs, positive_probs[noise_idx]])
+                    positive_probs[target_idx] = positive_probs[noise_idx]
+
+                consistency_scores[target_idx] = noise_score
+                scores_array[target_idx] = noise_score
+
+                replacements.append({
+                    'target_index': int(target_idx),
+                    'target_original_score': original_score,
+                    'noise_index': int(noise_idx),
+                    'noise_score': noise_score,
+                    'group': group['name']
+                })
+
+        if not replacements:
+            return pairs, pair_info, consistency_scores, anchor_probs, positive_probs, {
+                'enabled': True,
+                'status': 'skipped_no_replacements',
+                'mode': mode,
+                'threshold': threshold
+            }
+
+        summary = {
+            'enabled': True,
+            'status': 'applied',
+            'mode': mode,
+            'threshold': threshold,
+            'fraction': fraction,
+            'noise_pool': list(noise_range),
+            'total_replaced': len(replacements),
+            'group_breakdown': {}
+        }
+
+        for repl in replacements:
+            group_name = repl['group']
+            group_stats = summary['group_breakdown'].setdefault(group_name, {'count': 0})
+            group_stats['count'] += 1
+
+        print(" [噪声注入] 已替换高置信区样本:")
+        for group_name, stats in summary['group_breakdown'].items():
+            print(f"   {group_name}: {stats['count']} 个样本 → 使用区间 {noise_range} 噪声对替换")
+
+        return pairs, pair_info, consistency_scores, anchor_probs, positive_probs, summary
+
     def _save_enhanced_dataset(self, original_dataset_path: str, pairs: List[Tuple],
-                              consistency_scores: List[float], anchor_probs: np.ndarray,
-                              positive_probs: np.ndarray, method: str, output_dir: str) -> str:
+                              pair_info: List[dict], consistency_scores: List[float], anchor_probs: np.ndarray,
+                              positive_probs: np.ndarray, method: str, output_dir: str,
+                              filename_suffix: Optional[str] = None,
+                              noise_summary: Optional[Dict] = None) -> str:
         """
         保存增强的数据集，包含一致性得分和概率分布，并保留训练历史信息
 
@@ -853,12 +1135,35 @@ class ConsistencyScorer:
         # 创建增强数据集
         enhanced_samples = []
 
+        def _resolve_original_sample(idx_value):
+            if original_samples is None or idx_value is None:
+                return None
+
+            resolved_index = idx_value
+            if isinstance(resolved_index, str):
+                if resolved_index.isdigit():
+                    resolved_index = int(resolved_index)
+                else:
+                    return original_samples.get(resolved_index) if isinstance(original_samples, dict) else None
+
+            try:
+                if isinstance(original_samples, list) and isinstance(resolved_index, int):
+                    return original_samples[resolved_index]
+                if isinstance(original_samples, dict):
+                    return original_samples.get(resolved_index)
+            except Exception:
+                return None
+            return None
+
         for i, ((anchor_text, positive_text), score) in enumerate(zip(pairs, consistency_scores)):
+            info = pair_info[i] if i < len(pair_info) else {}
+            sample_index = info.get('sample_index', i)
+
             enhanced_sample = {
                 'anchor_content': anchor_text,
                 'positive_content': positive_text,
                 'consistency_score': score,
-                'sample_index': i,
+                'sample_index': sample_index,
                 'pair_type': 'enhanced_pair'
             }
 
@@ -870,23 +1175,29 @@ class ConsistencyScorer:
                 enhanced_sample['positive_probs'] = positive_probs[i].tolist()
 
             # 保留原始样本的训练历史信息（如果存在）
-            if original_samples and i < len(original_samples):
-                original_sample = original_samples[i]
-                if isinstance(original_sample, dict):
-                    # 保留训练历史字段
-                    for key in ['training_rounds', 'filter_history', 'last_trained_round']:
-                        if key in original_sample:
-                            enhanced_sample[key] = original_sample[key]
+            original_sample = _resolve_original_sample(sample_index)
+            if isinstance(original_sample, dict):
+                # 保留训练历史字段
+                for key in ['training_rounds', 'filter_history', 'last_trained_round']:
+                    if key in original_sample:
+                        enhanced_sample[key] = original_sample[key]
 
-                    # 保留其他元数据
-                    for key in ['sample_id', 'created_time', 'source_dataset']:
-                        if key in original_sample:
-                            enhanced_sample[key] = original_sample[key]
+                # 保留其他元数据
+                for key in ['sample_id', 'created_time', 'source_dataset']:
+                    if key in original_sample:
+                        enhanced_sample[key] = original_sample[key]
+
+            # 复制pair_info中的关键信息（如噪声标记等）
+            for meta_key in ['dataset_type', 'noise_injected', 'noise_original_score',
+                             'noise_replacement_score', 'noise_source_index', 'noise_group']:
+                if meta_key in info:
+                    enhanced_sample[meta_key] = info[meta_key]
 
             enhanced_samples.append(enhanced_sample)
 
         #  修改：增强数据集保存在同一输出目录下
-        enhanced_filename = f"enhanced_dataset_{method}.pkl"
+        suffix = f"_{filename_suffix}" if filename_suffix else ""
+        enhanced_filename = f"enhanced_dataset_{method}{suffix}.pkl"
         enhanced_dataset_path = os.path.join(output_dir, enhanced_filename)
 
         # 准备保存的数据结构
@@ -901,7 +1212,8 @@ class ConsistencyScorer:
                         'method': method,
                         'timestamp': datetime.now().isoformat(),
                         'original_dataset': original_dataset_path,
-                        'total_pairs': len(enhanced_samples)
+                        'total_pairs': len(enhanced_samples),
+                        'noise_injection': noise_summary or {'enabled': False}
                     }
                 }
             }
@@ -914,7 +1226,8 @@ class ConsistencyScorer:
                         'method': method,
                         'timestamp': datetime.now().isoformat(),
                         'original_dataset': original_dataset_path,
-                        'total_pairs': len(enhanced_samples)
+                        'total_pairs': len(enhanced_samples),
+                        'noise_injection': noise_summary or {'enabled': False}
                     }
                 }
             }
@@ -1065,7 +1378,7 @@ def parse_arguments():
                        help='输出目录 (默认: consistency_scores)')
 
     parser.add_argument('--method', type=str, default='confidence_weighted_dot_product',
-                       choices=['confidence_weighted_dot_product', 'kl_divergence', 'cosine_similarity', 'prediction_agreement'],
+                       choices=['confidence_weighted_dot_product', 'simple_dot_product', 'kl_divergence', 'cosine_similarity', 'prediction_agreement'],
                        help='一致性计算方法 (默认: confidence_weighted_dot_product)')
 
     parser.add_argument('--batch-size', '-b', type=int, default=32,
@@ -1164,6 +1477,8 @@ def main():
         print(f"    JSON结果: {output_filename}")
         if results['enhanced_dataset_path']:
             print(f"    增强数据集: {results['enhanced_dataset_path']}")
+        if results.get('noise_evaluation_dataset_path'):
+            print(f"    噪声评估数据集: {results['noise_evaluation_dataset_path']}")
         if results['statistics']:
             print(f" 共处理 {results['statistics'].get('count', 0)} 个样本对")
             print(f" 平均一致性得分: {results['statistics'].get('mean', 0):.4f}")
@@ -1181,7 +1496,7 @@ def run_consistency_scoring_interface(classifier_path: str, dataset_path: str,
     标准化接口：运行一致性评分
 
     Args:
-        classifier_path: 分类器路径（JSON文件或pth文件）
+        classifier_path: 分类器模型路径（.pth文件，直接来自监督学习的最优模型）
         dataset_path: 数据集路径
         config: 一致性评分配置字典
         output_dir: 输出目录
@@ -1191,7 +1506,7 @@ def run_consistency_scoring_interface(classifier_path: str, dataset_path: str,
     """
     import os
 
-    print(f" 一致性评分接口调用")
+    print(f"[一致性评分] 接口调用")
     print(f"   分类器: {classifier_path}")
     print(f"   数据集: {dataset_path}")
     print(f"   输出目录: {output_dir}")
@@ -1210,7 +1525,8 @@ def run_consistency_scoring_interface(classifier_path: str, dataset_path: str,
             method=config.get('method', 'confidence_weighted_dot_product'),
             max_pairs=config.get('max_pairs', None),
             batch_size=config.get('batch_size', 32),
-            save_enhanced_dataset=config.get('save_enhanced_dataset', True)
+            save_enhanced_dataset=config.get('save_enhanced_dataset', True),
+            noise_config=config.get('noise_injection')
         )
 
         # 保存结果
@@ -1238,9 +1554,9 @@ def run_consistency_scoring_interface(classifier_path: str, dataset_path: str,
                     break
 
         if enhanced_dataset_path:
-            print(f" 一致性评分完成，增强数据集: {enhanced_dataset_path}")
+            print(f"[一致性评分] 完成，增强数据集: {enhanced_dataset_path}")
         else:
-            print(f" 一致性评分完成，输出目录: {output_dir}")
+            print(f"[一致性评分] 完成，输出目录: {output_dir}")
 
         return output_dir
 

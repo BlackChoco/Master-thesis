@@ -113,11 +113,44 @@ class EnhancedContrastiveDataset(Dataset):
         scores = self.consistency_scores
 
         if strategy == 'linear':
-            # Linear策略：保持原始一致性得分作为权重，不归一化
-            print(f" Linear策略：使用原始一致性得分作为权重 [0,1]")
-            self.sample_weights = scores.copy()
-            # 不进行预过滤，保留所有样本
-            print(f" Linear策略：保留所有 {len(self.enhanced_samples)} 个样本")
+            # Linear策略：使用一致性得分作为连续权重，但过滤低于阈值的样本
+            try:
+                filter_threshold = float(threshold) if threshold is not None else 0.4
+            except (TypeError, ValueError):
+                print(f" Linear策略：无效阈值 {threshold}，使用默认值 0.4")
+                filter_threshold = 0.4
+
+            if filter_threshold <= 0 or filter_threshold >= 1:
+                print(f" Linear策略：阈值 {filter_threshold} 超出范围 (0,1)，使用默认值 0.4")
+                filter_threshold = 0.4
+
+            print(f" Linear策略：使用原始一致性得分作为权重 [0,1]，过滤阈值={filter_threshold}")
+
+            # 创建mask：低于阈值的样本权重设为0（进入负样本池），高于阈值的保留原始得分
+            valid_mask = scores >= filter_threshold
+            valid_indices = np.where(valid_mask)[0]
+
+            if len(valid_indices) == 0:
+                print(f" 警告：没有样本高于阈值 {filter_threshold}，保留所有样本")
+                self.sample_weights = scores.copy()
+            else:
+                # 应用阈值过滤：低于阈值→0.0，高于阈值→保留原始得分
+                self.sample_weights = np.where(valid_mask, scores, 0.0)
+
+                filtered_count = len(scores) - len(valid_indices)
+                print(f" Linear策略：保留 {len(valid_indices)}/{len(scores)} "
+                      f"({len(valid_indices)/len(scores):.1%}) 高置信样本，"
+                      f"{filtered_count} 个低置信样本进入负样本池")
+
+                # 显示过滤和保留样本的得分范围
+                if filtered_count > 0:
+                    print(f"  - 过滤样本 [0, {filter_threshold:.2f}) 得分范围: "
+                          f"[{np.min(scores[~valid_mask]):.4f}, {np.max(scores[~valid_mask]):.4f}]")
+                print(f"  - 保留样本 [{filter_threshold:.2f}, 1.0] 得分范围: "
+                      f"[{np.min(scores[valid_indices]):.4f}, {np.max(scores[valid_indices]):.4f}]")
+                print(f"  - 保留样本权重范围: "
+                      f"[{np.min(self.sample_weights[valid_indices]):.4f}, "
+                      f"{np.max(self.sample_weights[valid_indices]):.4f}]")
 
         elif strategy == 'threshold':
             # Threshold strategy: filter by configurable cutoff and assign binary weights
@@ -426,10 +459,11 @@ class WeightedContrastiveTrainer:
         print(f"   批次数量: {len(self.dataloader)}")
         print(f"   权重策略: {self.weighting_strategy}")
         if self.weighting_strategy == 'threshold':
-            print(f"   过滤阈值: 0.4 (固定)")
-            print(f"   策略说明: 预过滤[0,0.4)低置信样本，剩余样本等权重训练")
+            print(f"   过滤阈值: {self.weight_threshold}")
+            print(f"   策略说明: 预过滤[0,{self.weight_threshold})低置信样本(→负样本池)，剩余样本等权重=1.0训练")
         elif self.weighting_strategy == 'linear':
-            print(f"   策略说明: 使用原始一致性得分[0,1]作为样本权重")
+            print(f"   过滤阈值: {self.weight_threshold}")
+            print(f"   策略说明: 过滤[0,{self.weight_threshold})低置信样本(→负样本池)，剩余样本使用原始一致性得分作为连续权重")
         elif self.weighting_strategy == 'tiered':
             print(f"   策略说明: 分层离散权重 - [0,0.4)→0.0(负例), [0.4,0.6)→0.5, [0.6,0.8)→0.7, [0.8,1.0]→0.9")
 
