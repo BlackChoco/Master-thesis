@@ -724,9 +724,12 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
                 split_seed = config['data'].get('split_random_seed', 42)
                 label_data_shuffled = label_data.sample(n=len(label_data), random_state=split_seed).reset_index(drop=True)
 
-                # 按固定数量分割
-                label_train = label_data_shuffled[:config['data']['train_samples_per_label']]
-                label_val = label_data_shuffled[config['data']['train_samples_per_label']:config['data']['train_samples_per_label'] + config['data']['val_samples_per_label']]
+                # 按固定数量分割：训练集从前面取，验证集从后面取
+                train_count = config['data']['train_samples_per_label']
+                val_count = config['data']['val_samples_per_label']
+
+                label_train = label_data_shuffled[:train_count]  # 前N个作为训练集
+                label_val = label_data_shuffled[-val_count:]     # 后M个作为验证集
 
             df_train_list.append(label_train)
             df_val_list.append(label_val)
