@@ -583,9 +583,12 @@ CONFIG = {
         'excluded_labels': [],   # 要过滤的标签
         # 新增：固定数量分割配置
         'use_fixed_split': True,    # 是否使用固定数量分割而非比例分割
-        'train_samples_per_label': 500,  # 每个标签的训练样本数
-        'val_samples_per_label': 200,    # 每个标签的验证样本数
+        'train_samples_per_label': 500,  # 每个标签的训练样本数（从训练集文件采样）
+        'val_samples_per_label': 200,    # 每个标签的验证样本数（从验证数据源采样）
+        'test_samples_per_label': None,  # 每个标签的测试样本数（从测试数据源采样，None表示使用旧逻辑：验证集从训练集分割，测试集使用全部）
         'split_random_seed': 42,  # 数据划分的随机种子（控制哪些样本被选中）
+        # 新增：新采样策略配置（test_samples_per_label不为None时生效）
+        'use_test_for_val_and_test': False,  # 是否从测试集文件中同时采样验证集和测试集（不放回采样）
     },
 
     # 模型配置
@@ -697,8 +700,79 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
         df_test = df_test[df_test['label'] != label].reset_index(drop=True)
 
     #  关键修改：根据配置选择数据分割方式
-    if config['data']['use_fixed_split']:
-        print(f" 使用固定数量分割: 每个标签 {config['data']['train_samples_per_label']} 训练 + {config['data']['val_samples_per_label']} 验证...")
+    # ✅ 新增：检测是否使用新采样策略（从测试集中同时采样验证集和测试集）
+    use_new_sampling = config['data'].get('use_test_for_val_and_test', False) and \
+                       config['data'].get('test_samples_per_label') is not None
+
+    if use_new_sampling:
+        # 🆕 新采样策略：训练集从训练文件采样，验证集和测试集从测试文件采样（不放回）
+        print(f" 使用新采样策略：")
+        print(f"   - 训练集：从训练文件采样")
+        print(f"   - 验证集 + 测试集：从测试文件采样（不放回）")
+
+        # 从训练集文件按标签采样训练集
+        df_train_list = []
+        for label in df_train_full['label'].unique():
+            label_data = df_train_full[df_train_full['label'] == label].reset_index(drop=True)
+
+            required = config['data']['train_samples_per_label']
+            if len(label_data) < required:
+                print(f"  警告: 标签 '{label}' 训练数据只有 {len(label_data)} 条，需要 {required} 条")
+                print(f"   将使用所有可用数据")
+                label_train = label_data
+            else:
+                split_seed = config['data'].get('split_random_seed', 42)
+                label_data_shuffled = label_data.sample(n=len(label_data), random_state=split_seed).reset_index(drop=True)
+                label_train = label_data_shuffled[:required]
+
+            df_train_list.append(label_train)
+            print(f"   标签 '{label}': {len(label_train)} 训练样本")
+
+        df_train_prelim = pd.concat(df_train_list, ignore_index=True)
+
+        # 从测试集文件按标签采样验证集和测试集（不放回）
+        df_val_list = []
+        df_test_sampled_list = []
+
+        val_count = config['data']['val_samples_per_label']
+        test_count = config['data']['test_samples_per_label']
+
+        for label in df_test['label'].unique():
+            label_data = df_test[df_test['label'] == label].reset_index(drop=True)
+
+            required_total = val_count + test_count
+            if len(label_data) < required_total:
+                print(f"  警告: 标签 '{label}' 测试数据只有 {len(label_data)} 条，需要 {required_total} 条")
+                print(f"   将按比例分配验证集和测试集")
+                # 按比例分配
+                split_seed = config['data'].get('split_random_seed', 42)
+                val_ratio = val_count / required_total
+                label_val, label_test = train_test_split(
+                    label_data,
+                    test_size=(1 - val_ratio),
+                    random_state=split_seed
+                )
+            else:
+                # 使用可配置的随机种子进行采样（不放回）
+                split_seed = config['data'].get('split_random_seed', 42)
+                label_data_shuffled = label_data.sample(n=len(label_data), random_state=split_seed).reset_index(drop=True)
+
+                # 不放回采样：前N个作为验证集，后M个作为测试集
+                label_val = label_data_shuffled[:val_count]
+                label_test = label_data_shuffled[val_count:val_count + test_count]
+
+            df_val_list.append(label_val)
+            df_test_sampled_list.append(label_test)
+            print(f"   标签 '{label}': {len(label_val)} 验证, {len(label_test)} 测试（从测试文件采样）")
+
+        df_val = pd.concat(df_val_list, ignore_index=True)
+        df_test = pd.concat(df_test_sampled_list, ignore_index=True)  # ✅ 覆盖原测试集
+
+        print(f" 新采样策略完成: 训练集 {len(df_train_prelim)} 条, 验证集 {len(df_val)} 条, 测试集 {len(df_test)} 条")
+
+    elif config['data']['use_fixed_split']:
+        # 🔄 旧逻辑：固定数量分割（从训练集中分割验证集，测试集使用全部）
+        print(f" 使用固定数量分割（旧策略）: 每个标签 {config['data']['train_samples_per_label']} 训练 + {config['data']['val_samples_per_label']} 验证...")
 
         # 按标签分组并固定采样
         df_train_list = []
@@ -740,6 +814,7 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
 
         print(f" 固定数量分割完成: 训练集 {len(df_train_prelim)} 条, 验证集 {len(df_val)} 条")
     else:
+        # 📊 比例分割（最原始的逻辑）
         print(" 使用比例分割，确保实验间数据一致性...")
         split_seed = config['data'].get('split_random_seed', 42)
         df_train_prelim, df_val = train_test_split(
@@ -788,9 +863,17 @@ def run_single_experiment(config, hyperparams, experiment_output_dir=None, round
             cache_dir = config['optimization']['cache_dir']
 
         #  修复：基于完整数据集生成缓存键，包含轮次信息
-        train_cache_key = generate_cache_key(hyperparams['model_name'], df_train_prelim['content'].tolist(), 1.0, 256, round_num)  # 基于完整训练集
-        val_cache_key = generate_cache_key(hyperparams['model_name'], df_val['content'].tolist(), 1.0, 256, round_num)  # 验证集总是100%
-        test_cache_key = generate_cache_key(hyperparams['model_name'], df_test['content'].tolist(), 1.0, 256, round_num)  # 测试集总是100%
+        # ✅ 新增：根据采样策略生成不同的缓存键
+        if use_new_sampling:
+            # 新策略：训练集从训练文件，验证集和测试集从测试文件（已采样）
+            train_cache_key = generate_cache_key(hyperparams['model_name'], df_train_prelim['content'].tolist(), 1.0, 256, round_num)
+            val_cache_key = generate_cache_key(hyperparams['model_name'], df_val['content'].tolist(), 1.0, 256, round_num)  # 验证集已采样
+            test_cache_key = generate_cache_key(hyperparams['model_name'], df_test['content'].tolist(), 1.0, 256, round_num)  # 测试集已采样
+        else:
+            # 旧策略：训练集和验证集从训练文件，测试集使用完整测试文件
+            train_cache_key = generate_cache_key(hyperparams['model_name'], df_train_prelim['content'].tolist(), 1.0, 256, round_num)  # 基于完整训练集
+            val_cache_key = generate_cache_key(hyperparams['model_name'], df_val['content'].tolist(), 1.0, 256, round_num)  # 验证集已分割
+            test_cache_key = generate_cache_key(hyperparams['model_name'], df_test['content'].tolist(), 1.0, 256, round_num)  # 测试集使用全部
 
         # 加载或创建缓存（基于完整数据集）
         train_features_full = load_or_create_cache(train_cache_key, cache_dir, df_train_prelim['content'].tolist(),
@@ -1423,6 +1506,10 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
             config_copy['data']['train_samples_per_label'] = config['train_samples_per_label']
         if 'val_samples_per_label' in config:
             config_copy['data']['val_samples_per_label'] = config['val_samples_per_label']
+        if 'test_samples_per_label' in config:
+            config_copy['data']['test_samples_per_label'] = config['test_samples_per_label']
+        if 'use_test_for_val_and_test' in config:
+            config_copy['data']['use_test_for_val_and_test'] = config['use_test_for_val_and_test']
         if 'split_random_seed' in config:
             config_copy['data']['split_random_seed'] = config['split_random_seed']
 
@@ -1488,7 +1575,33 @@ def run_supervised_training_interface(encoder_path: str, config: dict, output_di
         if not best_run:
             raise RuntimeError("未获得有效的监督学习结果供迭代流程使用")
 
-        # ✅ 只对最优模型评估测试集（避免数据泄漏）
+        # ✅ 检查是否跳过测试集评估（Grid Search 模式）
+        skip_test_eval = config.get('skip_test_eval', False)
+
+        if skip_test_eval:
+            print(f"\n   [Grid Search 模式] 跳过测试集评估")
+            print(f"   最佳超参数: epoch={best_run['hyperparameters']['epochs']}, "
+                  f"lr={best_run['hyperparameters']['learning_rate']}, "
+                  f"bs={best_run['hyperparameters']['batch_size']}, "
+                  f"frac={best_run['hyperparameters']['data_fraction']}")
+            print(f"   验证集F1: {best_val_f1:.4f}")
+
+            # 返回结果（不包含测试集指标）
+            return {
+                'best_model_path': None,  # Grid Search 不保存模型
+                'hyperparameters': best_run['hyperparameters'],
+                'best_val_f1': best_val_f1,
+                'best_epoch': best_run.get('best_epoch'),
+                'train_loss_at_best': best_run.get('train_loss_at_best'),
+                'metrics': {
+                    'train': best_run.get('metrics_train', {}),
+                    'dev': best_run.get('metrics_val', {}),  # ✅ 使用 metrics_val
+                    'test': {}  # 空字典，表示未评估
+                },
+                'used_cache': best_run.get('use_cache', False)
+            }
+
+        # ✅ 标准模式：对最优模型评估测试集
         print(f"\n   [测试集评估] 只对最优超参数配置评估测试集...")
         print(f"   最佳超参数: epoch={best_run['hyperparameters']['epochs']}, "
               f"lr={best_run['hyperparameters']['learning_rate']}, "

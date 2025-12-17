@@ -88,26 +88,33 @@ class ContrastiveDataset1(Dataset):
     """
     Dataset1: 从相似度高于阈值的父子评论对中构建正样本
     用于学习局部语义相似性
+
+    优化：不保存 PostStorage 对象，减少 pkl 文件大小（从 336MB 降至 ~20MB）
     """
-    
-    def __init__(self, post_storage: PostStorage, similarity_threshold: float = 0.5, 
+
+    def __init__(self, post_storage: PostStorage, similarity_threshold: float = 0.5,
                  min_subtree_size: int = 2, max_samples_per_post: Optional[int] = None):
-        self.post_storage = post_storage
+        # ✅ 不保存 post_storage 引用（节省 50+ MB）
+        # self.post_storage = post_storage  # 移除
+
         self.similarity_threshold = similarity_threshold
         self.min_subtree_size = min_subtree_size
         self.positive_pairs = []
         self.comments_by_post = defaultdict(list)
-        self._build_dataset(max_samples_per_post)
+
+        # ✅ 将 post_storage 作为参数传递（临时使用）
+        self._build_dataset(post_storage, max_samples_per_post)
     
     def _ensure_str_content(self, content, default_str=""):
         if not isinstance(content, str):
             return default_str
         return content
 
-    def _build_dataset(self, max_samples_per_post: Optional[int]):
+    def _build_dataset(self, post_storage: PostStorage, max_samples_per_post: Optional[int]):
+        """✅ 接收 post_storage 作为参数（临时使用，不保存引用）"""
         print(" 构建Dataset1: 父子评论相似度对比学习数据集")
         total_pairs = 0
-        for post_id, forest in tqdm(self.post_storage.forests.items(), desc="处理帖子(Dataset1)"):
+        for post_id, forest in tqdm(post_storage.forests.items(), desc="处理帖子(Dataset1)"):
             post_pairs = []
             if forest.subtrees is None:
                 continue
@@ -124,6 +131,7 @@ class ContrastiveDataset1(Dataset):
             total_pairs += len(post_pairs)
             self._collect_comments_for_negative_sampling(forest, post_id)
         print(f" Dataset1构建完成: {total_pairs} 个正样本对，覆盖 {len(self.comments_by_post)} 个帖子")
+        print(f"   PostStorage 对象未保存，节省 ~50MB 磁盘空间")
 
     def _extract_high_similarity_pairs(self, root, post_id) -> List[Dict]:
         pairs = []
@@ -207,24 +215,31 @@ class ContrastiveDataset2(Dataset):
     """
     Dataset2: 从子树节点与子树平均内容构建正样本
     用于学习全局聚类相似性
+
+    优化：不保存 PostStorage 对象，减少 pkl 文件大小
     """
     def __init__(self, post_storage: PostStorage, min_subtree_size: int = 3,
                  max_samples_per_subtree: Optional[int] = None):
-        self.post_storage = post_storage
+        # ✅ 不保存 post_storage 引用
+        # self.post_storage = post_storage  # 移除
+
         self.min_subtree_size = max(min_subtree_size, 3)
         self.positive_pairs = []
         self.comments_by_post = defaultdict(list)
-        self._build_dataset(max_samples_per_subtree)
+
+        # ✅ 将 post_storage 作为参数传递
+        self._build_dataset(post_storage, max_samples_per_subtree)
 
     def _ensure_str_content(self, content, default_str=""):
         if not isinstance(content, str):
             return default_str
         return content
 
-    def _build_dataset(self, max_samples_per_subtree: Optional[int]):
+    def _build_dataset(self, post_storage: PostStorage, max_samples_per_subtree: Optional[int]):
+        """✅ 接收 post_storage 作为参数（临时使用，不保存引用）"""
         print(" 构建Dataset2: 节点-子树中心对比学习数据集")
         total_pairs = 0
-        for post_id, forest in tqdm(self.post_storage.forests.items(), desc="处理帖子(Dataset2)"):
+        for post_id, forest in tqdm(post_storage.forests.items(), desc="处理帖子(Dataset2)"):
             post_pairs = []
             if forest.subtrees is None: continue
 
@@ -242,6 +257,7 @@ class ContrastiveDataset2(Dataset):
             total_pairs += len(post_pairs)
             self._collect_comments_for_negative_sampling(forest, post_id)
         print(f" Dataset2构建完成: {total_pairs} 个正样本对，覆盖 {len(self.comments_by_post)} 个帖子")
+        print(f"   PostStorage 对象未保存，节省 ~50MB 磁盘空间")
 
     def _collect_subtree_node_contents(self, root) -> List[str]:
         contents = []
@@ -333,11 +349,169 @@ class ContrastiveDataset2(Dataset):
         return negative_contents
 
 
+class SimCSEDataset(Dataset):
+    """
+    SimCSE专用数据集：从剪枝后的高质量评论对中提取单条文本
+    用于SimCSE策略（通过dropout生成正样本对）
+
+    优化：不保存 PostStorage 对象，减少 pkl 文件大小
+
+    ✅ 数据源与 ContrastiveDataset1 一致（使用 forest.subtrees）
+
+    与ContrastiveDataset1的区别：
+    - ContrastiveDataset1: 存储父子评论对 (pair-based)
+    - SimCSEDataset: 从pair中提取单条文本，然后全局去重 (single-text-based)
+
+    优势：
+    - 使用相同的高质量数据源（剪枝后的subtrees）
+    - 全局去重，避免重复文本
+    - 数据结构更符合SimCSE原始设计
+    - 节省内存和计算资源
+    """
+
+    def __init__(self, post_storage: PostStorage,
+                 remove_duplicates: bool = True,
+                 min_text_length: int = 5,
+                 max_samples: Optional[int] = None,
+                 min_subtree_size: int = 2):
+        """
+        初始化SimCSE数据集
+
+        Args:
+            post_storage: 帖子存储对象
+            remove_duplicates: 是否去重相同文本（默认True）
+            min_text_length: 最小文本长度（默认5个字符，与Comment-Reply一致）
+            max_samples: 最大样本数量限制（默认None，不限制）
+            min_subtree_size: 最小子树大小（默认2，与Comment-Reply一致）
+        """
+        # ✅ 不保存 post_storage 引用
+        # self.post_storage = post_storage  # 移除
+
+        self.remove_duplicates = remove_duplicates
+        self.min_text_length = min_text_length
+        self.min_subtree_size = min_subtree_size
+        self.texts = []
+        self.text_metadata = []  # 记录每条文本的元信息
+
+        # ✅ 将 post_storage 作为参数传递
+        self._build_dataset(post_storage, max_samples)
+
+    def _ensure_str_content(self, content, default_str=""):
+        """确保内容是字符串格式"""
+        if not isinstance(content, str):
+            return default_str
+        return content
+
+    def _build_dataset(self, post_storage: PostStorage, max_samples: Optional[int]):
+        """
+        从剪枝后的forest.subtrees中提取所有评论文本
+
+        ✅ 接收 post_storage 作为参数（临时使用，不保存引用）
+        ✅ 数据源与 ContrastiveDataset1 一致
+        ✅ 使用相同的预处理和长度过滤
+        ✅ 全局去重（区别于 ContrastiveDataset1）
+        """
+        print(f" 构建SimCSEDataset: 从剪枝后的高质量评论中提取单文本")
+        print(f"   数据源: forest.subtrees（与Comment-Reply一致）")
+        print(f"   去重设置: {self.remove_duplicates}")
+        print(f"   最小文本长度: {self.min_text_length}")
+        print(f"   最小子树大小: {self.min_subtree_size}")
+
+        all_texts_with_meta = []  # [(text, post_id, comment_id), ...]
+        seen_texts = set()  # 用于全局去重
+        total_subtrees_processed = 0
+        total_comments_before_dedup = 0
+
+        # ✅ 使用参数传入的 post_storage
+        for post_id, forest in tqdm(post_storage.forests.items(), desc="提取评论(SimCSE)"):
+            if forest.subtrees is None:
+                continue
+
+            # 遍历剪枝后的子树（与 ContrastiveDataset1 一致）
+            for subtree_info in forest.subtrees:
+                if subtree_info['size'] >= self.min_subtree_size:
+                    total_subtrees_processed += 1
+
+                    # 从子树中提取所有评论文本
+                    def traverse_subtree(node):
+                        """递归遍历子树，提取所有评论文本"""
+                        results = []
+
+                        content_raw = self._ensure_str_content(node.content)
+                        content_clean = preprocess_text(content_raw)
+
+                        # ✅ 使用与 ContrastiveDataset1 相同的长度过滤
+                        if len(content_clean) >= self.min_text_length:
+                            results.append((content_clean, post_id, node.comment_id))
+
+                        # 递归处理子节点
+                        for child in node.children:
+                            results.extend(traverse_subtree(child))
+
+                        return results
+
+                    # 提取当前子树的所有文本
+                    subtree_texts = traverse_subtree(subtree_info['root'])
+                    total_comments_before_dedup += len(subtree_texts)
+
+                    # 全局去重（区别于 ContrastiveDataset1）
+                    for text, pid, cid in subtree_texts:
+                        if self.remove_duplicates:
+                            if text not in seen_texts:
+                                seen_texts.add(text)
+                                all_texts_with_meta.append((text, pid, cid))
+                        else:
+                            all_texts_with_meta.append((text, pid, cid))
+
+        # 如果设置了最大样本数，随机采样
+        if max_samples and len(all_texts_with_meta) > max_samples:
+            print(f"   随机采样 {max_samples} / {len(all_texts_with_meta)} 条文本")
+            all_texts_with_meta = random.sample(all_texts_with_meta, max_samples)
+
+        # 分离文本和元数据
+        self.texts = [item[0] for item in all_texts_with_meta]
+        self.text_metadata = [{'post_id': item[1], 'comment_id': item[2]} for item in all_texts_with_meta]
+
+        # 输出统计信息
+        print(f" SimCSEDataset构建完成:")
+        print(f"   数据源: forest.subtrees（剪枝后的高质量子树）")
+        print(f"   处理的子树数: {total_subtrees_processed}")
+        print(f"   去重前评论数: {total_comments_before_dedup}")
+        print(f"   去重后文本数: {len(self.texts)}")
+        if total_comments_before_dedup > 0:
+            dedup_ratio = (total_comments_before_dedup - len(self.texts)) / total_comments_before_dedup * 100
+            print(f"   去重比例: {dedup_ratio:.1f}% ({total_comments_before_dedup - len(self.texts)} 条重复)")
+        print(f"   平均文本长度: {np.mean([len(t) for t in self.texts]):.1f} 字符")
+        if self.texts:
+            print(f"   最短文本: {min(len(t) for t in self.texts)} 字符")
+            print(f"   最长文本: {max(len(t) for t in self.texts)} 字符")
+        print(f"   PostStorage 对象未保存，节省 ~50MB 磁盘空间")
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        """
+        返回单条文本（SimCSE会通过两次不同的dropout生成正样本对）
+        """
+        return {
+            'content': self.texts[idx],
+            'post_id': self.text_metadata[idx]['post_id'],
+            'comment_id': self.text_metadata[idx]['comment_id'],
+            'sample_index': idx,
+            'pair_type': 'simcse_single_text'  # 标识这是SimCSE单文本样本
+        }
+
+
 class ContrastiveDataCollator:
     """
     自定义的DataCollator，用于批量处理并动态添加负样本
+    支持三种数据集类型：
+    - ContrastiveDataset1: 父子评论对
+    - ContrastiveDataset2: 节点-子树中心对
+    - SimCSEDataset: 单文本（SimCSE策略）
     """
-    def __init__(self, dataset: Union[ContrastiveDataset1, ContrastiveDataset2], num_negatives: int = 2):
+    def __init__(self, dataset: Union[ContrastiveDataset1, ContrastiveDataset2, 'SimCSEDataset'], num_negatives: int = 2):
         self.dataset = dataset
         self.num_negatives = num_negatives
     
@@ -347,9 +521,32 @@ class ContrastiveDataCollator:
         return content if content else default_str
 
     def __call__(self, batch: List[Dict]) -> Dict[str, any]:
-        anchor_texts = [self._ensure_str_content(item['anchor_content']) for item in batch]
-        
-        positive_texts_ds1 = [] 
+        """
+        处理批次数据，支持三种数据集类型：
+        - parent_child: ContrastiveDataset1 (父子评论对)
+        - node_center: ContrastiveDataset2 (节点-子树中心)
+        - simcse_single_text: SimCSEDataset (单文本)
+        """
+        # 检测数据集类型
+        if batch and batch[0].get('pair_type') == 'simcse_single_text':
+            # SimCSE单文本模式：直接返回文本列表
+            texts = [self._ensure_str_content(item['content']) for item in batch]
+            return {
+                'anchor_texts': texts,  # 用于第一次前向传播
+                'positive_texts_ds1': None,  # SimCSE不使用
+                'positive_content_lists_ds2': [],
+                'negative_texts': [],
+                'post_ids': [item['post_id'] for item in batch],
+                'pair_types': ['simcse_single_text'] * len(batch),
+                'sample_indices': [item.get('sample_index', -1) for item in batch],
+                'num_negatives': 0,  # SimCSE使用in-batch负样本
+                'is_simcse': True  # 标识这是SimCSE批次
+            }
+
+        # 原有的pair-based数据集处理逻辑
+        anchor_texts = [self._ensure_str_content(item.get('anchor_content', '')) for item in batch]
+
+        positive_texts_ds1 = []
         positive_content_lists_ds2 = []
 
         for item in batch:
@@ -366,37 +563,38 @@ class ContrastiveDataCollator:
                 else:
                     positive_content_lists_ds2.append([self._ensure_str_content(content_list)])
             else:
-                positive_texts_ds1.append(self._ensure_str_content(item.get('positive_content', item['anchor_content'])))
+                positive_texts_ds1.append(self._ensure_str_content(item.get('positive_content', item.get('anchor_content', ''))))
                 positive_content_lists_ds2.append(None)
-        
+
         negative_texts = []
         if self.num_negatives > 0:
             for item in batch:
-                post_id = item['post_id']
+                post_id = item.get('post_id', '')
                 neg_contents = []
                 if hasattr(self.dataset, 'get_negative_samples'):
                     neg_contents = self.dataset.get_negative_samples(post_id, self.num_negatives)
-                
+
                 processed_neg_contents = []
                 for neg_c in neg_contents:
                     processed_neg_contents.append(self._ensure_str_content(neg_c))
-                
+
                 while len(processed_neg_contents) < self.num_negatives:
-                    other_items_texts = [self._ensure_str_content(b['anchor_content']) for b in batch if b['post_id'] != post_id and self._ensure_str_content(b['anchor_content'])]
+                    other_items_texts = [self._ensure_str_content(b.get('anchor_content', '')) for b in batch if b.get('post_id', '') != post_id and self._ensure_str_content(b.get('anchor_content', ''))]
                     if other_items_texts:
                         processed_neg_contents.append(random.choice(other_items_texts))
                     else:
-                        processed_neg_contents.append(self._ensure_str_content("")) 
-                
+                        processed_neg_contents.append(self._ensure_str_content(""))
+
                 negative_texts.extend(processed_neg_contents[:self.num_negatives])
-        
+
         return {
             'anchor_texts': anchor_texts,
             'positive_texts_ds1': positive_texts_ds1,
             'positive_content_lists_ds2': positive_content_lists_ds2,
             'negative_texts': negative_texts,
-            'post_ids': [item['post_id'] for item in batch],
+            'post_ids': [item.get('post_id', '') for item in batch],
             'pair_types': [item.get('pair_type', 'unknown') for item in batch],
-            'sample_indices': [item.get('sample_index', -1) for item in batch],  #  新增：样本索引
-            'num_negatives': self.num_negatives
+            'sample_indices': [item.get('sample_index', -1) for item in batch],
+            'num_negatives': self.num_negatives,
+            'is_simcse': False  # 标识这不是SimCSE批次
         }

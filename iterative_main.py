@@ -74,7 +74,8 @@ class IterativeExperimentManager:
     """迭代实验管理器（增强版，支持断点续传和多变体实验）"""
 
     def __init__(self, config_path: str, experiment_dir: Optional[str] = None,
-                 resume: bool = False, force_restart: bool = False):
+                 resume: bool = False, force_restart: bool = False,
+                 use_fresh_bert: Optional[bool] = None):
         """
         初始化实验管理器
 
@@ -83,11 +84,19 @@ class IterativeExperimentManager:
             experiment_dir: 实验目录，如果不指定则自动创建
             resume: 是否启用断点续传
             force_restart: 是否强制重新开始
+            use_fresh_bert: 是否每轮从原始BERT重新训练（命令行参数，会覆盖YAML配置）
         """
         self.config = self._load_config(config_path)
         self.experiment_name = self.config['experiment_meta']['name']
         self.resume = resume and not force_restart
         self.force_restart = force_restart
+
+        # ✨ 处理模型基座选择参数（命令行优先级 > YAML配置）
+        if use_fresh_bert is not None:
+            # 命令行参数覆盖YAML配置
+            if 'experiment_meta' not in self.config:
+                self.config['experiment_meta'] = {}
+            self.config['experiment_meta']['use_fresh_bert_each_round'] = use_fresh_bert
 
         if experiment_dir:
             self.experiment_dir = experiment_dir
@@ -113,6 +122,13 @@ class IterativeExperimentManager:
         print(f"实验名称: {self.experiment_name}")
         print(f"断点续传: {'启用' if self.resume else '禁用'}")
         print(f"强制重启: {'是' if self.force_restart else '否'}")
+
+        # ✨ 显示模型基座模式
+        use_fresh = self.config.get('experiment_meta', {}).get('use_fresh_bert_each_round', False)
+        if use_fresh:
+            print(f"模型基座: 每轮从原始BERT重新训练 ✨")
+        else:
+            print(f"模型基座: 累积训练（每轮基于上一轮模型）")
 
     def _load_config(self, config_path: str) -> Dict:
         """加载配置文件"""
@@ -252,7 +268,9 @@ class IterativeExperimentManager:
                 else:
                     print("[执行] ▶️  开始Stage 1对比学习...")
                     encoder_path = self._run_stage1_contrastive(round_config, round_dir)
-                    self.state_manager.save_stage_completion(round_num, 'stage1_contrastive', encoder_path)
+                    # ✅ Grid Search 模式会返回 None
+                    if encoder_path:
+                        self.state_manager.save_stage_completion(round_num, 'stage1_contrastive', encoder_path)
             else:
                 stage2_done, encoder_path = detector.detect_stage2_contrastive_status()
                 if stage2_done and self.resume:
@@ -260,10 +278,22 @@ class IterativeExperimentManager:
                 else:
                     print("[执行] ▶️  开始Stage 2对比学习...")
                     encoder_path = self._run_stage2_weighted_contrastive(round_num, round_config, round_dir)
-                    self.state_manager.save_stage_completion(round_num, 'stage2_contrastive', encoder_path)
+                    if encoder_path:
+                        self.state_manager.save_stage_completion(round_num, 'stage2_contrastive', encoder_path)
 
             if not encoder_path:
-                raise RuntimeError(f"第 {round_num} 轮对比学习失败")
+                # ✅ Grid Search 模式：跳过后续流程
+                print(f"\n{'='*60}")
+                print(f"⚠️  Grid Search 模式：Round {round_num} 仅生成评估结果")
+                print(f"   请查看 Grid Search 结果，选择最佳超参数后手动配置并重新运行")
+                print(f"{'='*60}\n")
+
+                # 标记轮次为 grid_search_only
+                round_entry['status'] = 'grid_search_only'
+                round_entry['end_time'] = datetime.now().isoformat()
+                self._save_log()
+
+                return True  # 返回成功，但跳过后续流程
 
             print(f"[完成] 编码器训练完成: {encoder_path}")
 
@@ -363,7 +393,19 @@ class IterativeExperimentManager:
                 encoder_path = self._run_stage2_weighted_contrastive(round_num, round_config, round_dir)
 
             if not encoder_path:
-                raise RuntimeError(f"第 {round_num} 轮对比学习失败")
+                # ✅ Grid Search 模式：跳过后续流程
+                print(f"\n{'='*60}")
+                print(f"⚠️  Grid Search 模式：Round {round_num} 仅生成评估结果")
+                print(f"   请查看 Grid Search 结果，选择最佳超参数后手动配置并重新运行")
+                print(f"{'='*60}\n")
+
+                # 标记轮次为 grid_search_only
+                round_entry = self.experiment_log['rounds'][f'round{round_num}']
+                round_entry['status'] = 'grid_search_only'
+                round_entry['end_time'] = datetime.now().isoformat()
+                self._save_log()
+
+                return True  # 返回成功，但跳过后续流程
 
             print(f"[完成] 编码器训练完成: {encoder_path}")
 
@@ -432,27 +474,115 @@ class IterativeExperimentManager:
         # 设置输出目录为实验目录（确保数据集保存在实验目录内）
         stage1_config['output_dir'] = output_dir
 
-        model_path = run_stage1_contrastive_training(stage1_config, output_dir)
+        # ✅ 修复：传入完整配置（包含 supervised_learning 等）
+        result = run_stage1_contrastive_training(
+            stage1_config,
+            output_dir,
+            self.config  # 传入完整配置树（用于 Grid Search 评估）
+        )
 
-        # 同时保存生成的数据集路径信息
-        self.experiment_log['rounds'][f'round1']['dataset_path'] = os.path.join(output_dir, 'dataset.pkl')
+        # ✅ 处理 Grid Search 返回字典的情况
+        if isinstance(result, dict) and result.get('mode') == 'grid_search':
+            # Grid Search 模式：不返回模型，记录最佳超参数
+            print(f"\n[Grid Search] 完成 {result['total_runs']} 次运行")
+            print(f"[Grid Search] 成功: {result['successful_runs']} 次")
+
+            if result['best_hyperparameters']:
+                print(f"\n[Grid Search] 最佳超参数:")
+                for key, value in result['best_hyperparameters'].items():
+                    print(f"   - {key}: {value}")
+
+                print(f"\n[Grid Search] 最佳验证集指标:")
+                if result['best_metrics']:
+                    print(f"   - Val F1: {result['best_metrics']['val_f1']:.4f}")
+                    print(f"   - Val Accuracy: {result['best_metrics']['val_accuracy']:.4f}")
+                    print(f"   - Val Precision: {result['best_metrics']['val_precision']:.4f}")
+                    print(f"   - Val Recall: {result['best_metrics']['val_recall']:.4f}")
+
+            # 记录 Grid Search 结果到实验日志
+            self.experiment_log['rounds'][f'round1']['grid_search'] = {
+                'total_runs': result['total_runs'],
+                'successful_runs': result['successful_runs'],
+                'best_hyperparameters': result['best_hyperparameters'],
+                'best_metrics': result['best_metrics'],
+                'results_file': result['results_file']
+            }
+
+            self._save_log()
+
+            # ⚠️ Grid Search 模式：跳过后续流程（没有模型）
+            print(f"\n⚠️  Grid Search 模式：仅生成评估结果，不继续后续流程")
+            print(f"   结果文件: {result['results_file']}")
+            print(f"\n💡 请查看 Grid Search 结果，选择最佳超参数后手动重新训练")
+
+            return None  # 返回 None 表示没有模型
+
+        # 单次训练模式：返回模型路径
+        model_path = result
+
+        # ✅ 从checkpoint读取并记录数据集大小到实验日志
+        try:
+            import torch
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+            dataset_sizes = checkpoint.get('training_history', {}).get('dataset_sizes', {})
+            positive_pair_strategy = checkpoint.get('positive_pair_strategy', 'unknown')
+
+            # 获取最新的数据集大小（最后一次构建）
+            ds1_size = dataset_sizes.get('dataset1', [0])[-1] if dataset_sizes.get('dataset1') else 0
+            ds2_size = dataset_sizes.get('dataset2', [0])[-1] if dataset_sizes.get('dataset2') else 0
+
+            # 记录到实验日志
+            self.experiment_log['rounds'][f'round1']['dataset_info'] = {
+                'dataset_path': os.path.join(output_dir, 'dataset.pkl'),
+                'dataset1_size': int(ds1_size),
+                'dataset2_size': int(ds2_size),
+                'positive_pair_strategy': positive_pair_strategy,
+                'dataset_sizes_history': {
+                    'dataset1': [int(x) for x in dataset_sizes.get('dataset1', [])],
+                    'dataset2': [int(x) for x in dataset_sizes.get('dataset2', [])]
+                }
+            }
+
+            print(f"[记录] 数据集大小已保存到实验日志:")
+            print(f"   - 策略: {positive_pair_strategy}")
+            print(f"   - Dataset1: {ds1_size}")
+            print(f"   - Dataset2: {ds2_size}")
+
+        except Exception as e:
+            print(f"[警告] 无法从checkpoint读取数据集大小: {e}")
+            # 降级处理：只记录路径
+            self.experiment_log['rounds'][f'round1']['dataset_path'] = os.path.join(output_dir, 'dataset.pkl')
+
+        self._save_log()
 
         return model_path
 
     def _run_stage2_weighted_contrastive(self, round_num: int, config: Dict, round_dir: str) -> Optional[str]:
         """运行Stage 2+加权对比学习"""
-        print(f"[Stage 2+] 运行Stage 2+加权对比学习（基于第{round_num-1}轮）...")
 
-        # 查找上一轮的编码器和增强数据集
-        prev_encoder = self._find_previous_encoder(round_num)
+        # ✅ 检查是否每轮从原始BERT重新训练
+        use_fresh_bert = self.config.get('experiment_meta', {}).get('use_fresh_bert_each_round', False)
+
+        if use_fresh_bert:
+            # 从原始BERT重新训练模式
+            stage1_config = self.config.get('defaults', {}).get('stage1_contrastive', {})
+            prev_encoder = stage1_config.get('model_name_or_path', 'google-bert/bert-base-chinese')
+            print(f"[Stage 2+] 从原始BERT重新训练（Round {round_num}）")
+            print(f"  ✨ 模式: 固定原始BERT基座")
+            print(f"  使用模型: {prev_encoder}")
+        else:
+            # 累积训练模式（默认）
+            prev_encoder = self._find_previous_encoder(round_num)
+            if not prev_encoder:
+                raise FileNotFoundError(f"找不到第{round_num-1}轮的编码器")
+            print(f"[Stage 2+] 累积训练模式（基于第{round_num-1}轮）")
+            print(f"  使用编码器: {prev_encoder}")
+
+        # 查找上一轮的增强数据集（两种模式都需要）
         prev_enhanced_dataset = self._find_previous_enhanced_dataset(round_num)
-
-        if not prev_encoder:
-            raise FileNotFoundError(f"找不到第{round_num-1}轮的编码器")
         if not prev_enhanced_dataset:
             raise FileNotFoundError(f"找不到第{round_num-1}轮的增强数据集")
 
-        print(f"  使用编码器: {prev_encoder}")
         print(f"  使用增强数据集: {prev_enhanced_dataset}")
 
         if not run_stage2_weighted_contrastive:
@@ -1542,6 +1672,12 @@ def parse_arguments():
     parser.add_argument('--noise-seed', type=int, default=None,
                        help='噪声注入过程的随机种子，默认随机。')
 
+    # ✨ 新增：模型基座选择
+    parser.add_argument('--use-fresh-bert', action='store_true',
+                       help='每轮从原始BERT重新训练（固定原始BERT基座模式）。'
+                            '默认为累积训练模式（每轮基于上一轮模型继续训练）。'
+                            '此参数会覆盖YAML配置中的 use_fresh_bert_each_round 设置。')
+
     # 其他选项
     parser.add_argument('--check-status', action='store_true',
                        help='仅检查实验状态，不运行')
@@ -1581,7 +1717,8 @@ def main():
             config_path=args.config,
             experiment_dir=args.experiment_dir,
             resume=args.resume,
-            force_restart=args.force_restart
+            force_restart=args.force_restart,
+            use_fresh_bert=args.use_fresh_bert if args.use_fresh_bert else None  # ✨ 传递模型基座参数
         )
 
         # 运行多变体实验

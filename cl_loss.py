@@ -8,13 +8,14 @@ class ContrastiveLoss(torch.nn.Module):
     对比损失函数，支持三种InfoNCE变体和样本权重
     """
     def __init__(self, temperature: float = 0.07, loss_type: str = 'infonce',
-                 infonce_mode: str = 'unidirectional'):
+                 infonce_mode: str = 'unidirectional', bidirectional_loss: bool = True):
         super().__init__()
         self.temperature = temperature
         self.loss_type = loss_type
         self.infonce_mode = infonce_mode
+        self.bidirectional_loss = bidirectional_loss  # 新增: 控制in-batch模式的方向性
         self.cosine_sim = torch.nn.CosineSimilarity(dim=-1)
-        print(f"  ContrastiveLoss配置: 类型={loss_type}, InfoNCE模式={infonce_mode}, 温度={temperature}")
+        print(f"  ContrastiveLoss配置: 类型={loss_type}, InfoNCE模式={infonce_mode}, 温度={temperature}, 双向={bidirectional_loss}")
 
     def forward(self, anchor, positive, negatives=None, sample_weights=None):
         """
@@ -82,7 +83,7 @@ class ContrastiveLoss(torch.nn.Module):
         return (loss1 + loss2) / 2.0
     
     def _infonce_loss_in_batch(self, anchor, positive, sample_weights=None):
-        """批内InfoNCE损失"""
+        """批内InfoNCE损失 - 支持双向/单向可配置"""
         batch_size = anchor.shape[0]
         if batch_size <= 1:
             return torch.tensor(0.0, device=anchor.device, requires_grad=True)
@@ -90,25 +91,31 @@ class ContrastiveLoss(torch.nn.Module):
         anchor_norm = F.normalize(anchor, dim=-1)
         positive_norm = F.normalize(positive, dim=-1)
 
+        # 计算 anchor→positive 方向
         similarity_matrix_ap = torch.matmul(anchor_norm, positive_norm.t()) / self.temperature
         labels_ap = torch.arange(batch_size, device=anchor.device)
+        loss_ap = F.cross_entropy(similarity_matrix_ap, labels_ap, reduction='none')
 
-        similarity_matrix_pa = torch.matmul(positive_norm, anchor_norm.t()) / self.temperature
-        labels_pa = torch.arange(batch_size, device=anchor.device)
-
-        if sample_weights is not None:
-            # 使用样本权重的交叉熵损失
-            loss_ap = F.cross_entropy(similarity_matrix_ap, labels_ap, reduction='none')
+        if self.bidirectional_loss:
+            # 双向: 同时计算 positive→anchor 方向
+            similarity_matrix_pa = torch.matmul(positive_norm, anchor_norm.t()) / self.temperature
+            labels_pa = torch.arange(batch_size, device=anchor.device)
             loss_pa = F.cross_entropy(similarity_matrix_pa, labels_pa, reduction='none')
 
-            weighted_loss_ap = loss_ap * sample_weights
-            weighted_loss_pa = loss_pa * sample_weights
-
-            return (weighted_loss_ap.mean() + weighted_loss_pa.mean()) / 2.0
+            if sample_weights is not None:
+                # 使用样本权重
+                weighted_loss_ap = loss_ap * sample_weights
+                weighted_loss_pa = loss_pa * sample_weights
+                return (weighted_loss_ap.mean() + weighted_loss_pa.mean()) / 2.0
+            else:
+                return (loss_ap.mean() + loss_pa.mean()) / 2.0
         else:
-            loss_ap = F.cross_entropy(similarity_matrix_ap, labels_ap)
-            loss_pa = F.cross_entropy(similarity_matrix_pa, labels_pa)
-            return (loss_ap + loss_pa) / 2.0
+            # 单向: 仅使用 anchor→positive 方向
+            if sample_weights is not None:
+                weighted_loss = loss_ap * sample_weights
+                return weighted_loss.mean()
+            else:
+                return loss_ap.mean()
 
     def _compute_single_direction_loss(self, query, positive_key, negative_keys, sample_weights=None):
         """计算单向损失"""

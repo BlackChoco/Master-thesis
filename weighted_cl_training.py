@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import os
 import pickle
+import random
 from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 import argparse
@@ -13,6 +14,8 @@ from torch.utils.data import Dataset, DataLoader
 
 # 导入必要的模块
 from cl_base_model import ContrastiveEncoder
+# 导入set_seed函数（从cl_training.py）
+from cl_training import set_seed
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -120,11 +123,17 @@ class EnhancedContrastiveDataset(Dataset):
                 print(f" Linear策略：无效阈值 {threshold}，使用默认值 0.4")
                 filter_threshold = 0.4
 
-            if filter_threshold <= 0 or filter_threshold >= 1:
-                print(f" Linear策略：阈值 {filter_threshold} 超出范围 (0,1)，使用默认值 0.4")
+            # ✅ 修改：允许 threshold=0.0 表示全量训练
+            # 有效范围：[0.0, 1.0) 左闭右开区间（threshold=1.0无意义，会过滤所有样本）
+            if filter_threshold < 0 or filter_threshold >= 1:
+                print(f" Linear策略：阈值 {filter_threshold} 超出范围 [0,1)，使用默认值 0.4")
                 filter_threshold = 0.4
 
-            print(f" Linear策略：使用原始一致性得分作为权重 [0,1]，过滤阈值={filter_threshold}")
+            # ✅ 新增：threshold=0.0 的特殊提示
+            if filter_threshold == 0.0:
+                print(f" Linear策略：阈值=0.0，使用原始一致性得分作为权重 [0,1]，不进行过滤（全量训练）")
+            else:
+                print(f" Linear策略：使用原始一致性得分作为权重 [0,1]，过滤阈值={filter_threshold}")
 
             # 创建mask：低于阈值的样本权重设为0（进入负样本池），高于阈值的保留原始得分
             valid_mask = scores >= filter_threshold
@@ -160,11 +169,17 @@ class EnhancedContrastiveDataset(Dataset):
                 print(f" Threshold strategy: invalid threshold {threshold}, fallback to 0.4")
                 filter_threshold = 0.4
 
-            if filter_threshold <= 0 or filter_threshold >= 1:
-                print(f" Threshold strategy: threshold {filter_threshold} out of (0,1), fallback to 0.4")
+            # ✅ 修改：允许 threshold=0.0 表示全量训练，threshold=1.0 表示只保留最高置信样本
+            # 有效范围：[0.0, 1.0] 闭区间
+            if filter_threshold < 0 or filter_threshold > 1:
+                print(f" Threshold strategy: threshold {filter_threshold} out of [0,1], fallback to 0.4")
                 filter_threshold = 0.4
 
-            print(f" Threshold strategy: using cutoff={filter_threshold} to pre-filter low-confidence samples")
+            # ✅ 新增：threshold=0.0 的特殊提示
+            if filter_threshold == 0.0:
+                print(f" Threshold strategy: threshold=0.0 detected - using ALL samples (no filtering)")
+            else:
+                print(f" Threshold strategy: using cutoff={filter_threshold} to pre-filter low-confidence samples")
 
             # Keep only samples with confidence >= threshold
             valid_mask = scores >= filter_threshold
@@ -358,8 +373,11 @@ class WeightedContrastiveTrainer:
     """
 
     def __init__(self, enhanced_dataset_path: str, pretrained_model_path: str,
+                 seed: int = 42,  # ✅ 新增：随机种子
                  weighting_strategy: str = 'linear', weight_threshold: float = 0.3,
                  batch_size: int = 16, base_lr: float = 5e-6, projection_lr: float = 5e-5,
+                 temperature: float = 0.07,  # InfoNCE损失温度系数
+                 bidirectional_loss: bool = False,  # 新增：控制Stage2的方向性（默认单向）
                  use_peft: bool = True, peft_config: dict = None, round_num: int = 2,
                  use_filtered_negatives: bool = False, negative_sample_ratio: float = 0.5):
         """
@@ -368,17 +386,24 @@ class WeightedContrastiveTrainer:
         Args:
             enhanced_dataset_path: 增强数据集路径
             pretrained_model_path: 预训练对比学习模型路径 (必须指定)
+            seed: 随机种子（确保可复现性）
             weighting_strategy: 权重策略
             weight_threshold: 权重阈值
             batch_size: 批次大小
             base_lr: 基础学习率
             projection_lr: 投影头学习率
+            temperature: InfoNCE损失温度系数
+            bidirectional_loss: 是否使用双向损失（默认False，保持原有单向行为）
             use_peft: 是否使用PEFT/LoRA
             peft_config: PEFT配置字典
             round_num: 当前轮次编号 (用于记录训练历史)
             use_filtered_negatives: 是否使用被筛掉的样本作为负例
             negative_sample_ratio: 负样本采样比例
         """
+        # ✅ 首先设置随机种子，确保所有后续操作可复现
+        set_seed(seed)
+        self.seed = seed
+
         self.enhanced_dataset_path = enhanced_dataset_path
         self.pretrained_model_path = pretrained_model_path
         self.weighting_strategy = weighting_strategy
@@ -386,8 +411,14 @@ class WeightedContrastiveTrainer:
         self.batch_size = batch_size
         self.base_lr = base_lr
         self.projection_lr = projection_lr
+        self.temperature = temperature  # InfoNCE损失温度系数
+        self.bidirectional_loss = bidirectional_loss  # 新增：双向损失控制
         self.use_peft = use_peft
         self.round_num = round_num  # 新增：轮次信息
+
+        # 验证温度参数范围
+        if not (0.01 <= temperature <= 1.0):
+            raise ValueError(f"temperature必须在[0.01, 1.0]范围内，得到{temperature}")
 
         # 新增：负样本相关参数
         self.use_filtered_negatives = use_filtered_negatives
@@ -420,6 +451,8 @@ class WeightedContrastiveTrainer:
         print(f"   模型路径: {self.pretrained_model_path}")
         print(f"   数据集路径: {self.enhanced_dataset_path}")
         print(f"   权重策略: {self.weighting_strategy}")
+        print(f"   温度系数: {self.temperature}")
+        print(f"   双向损失: {self.bidirectional_loss}")
         print(f"   使用PEFT: {self.use_peft}")
         if self.use_peft:
             print(f"   PEFT配置: r={self.peft_config['r']}, alpha={self.peft_config['lora_alpha']}")
@@ -438,12 +471,17 @@ class WeightedContrastiveTrainer:
             negative_sample_ratio=self.negative_sample_ratio
         )
 
-        # 创建数据整理器，传递负样本池
+        # 创建数据整理器，传递负样本池和随机种子
         collator = EnhancedDataCollator(
             negative_sample_pool=self.enhanced_dataset.negative_sample_pool,
             negative_sample_ratio=self.negative_sample_ratio,
-            use_filtered_negatives=self.use_filtered_negatives
+            use_filtered_negatives=self.use_filtered_negatives,
+            seed=self.seed  # ✅ 传递随机种子
         )
+
+        # ✅ 创建可复现的随机数生成器（用于 DataLoader shuffle）
+        g = torch.Generator()
+        g.manual_seed(self.seed)
 
         # 创建数据加载器
         self.dataloader = DataLoader(
@@ -451,12 +489,14 @@ class WeightedContrastiveTrainer:
             batch_size=self.batch_size,
             shuffle=True,
             collate_fn=collator,
-            num_workers=0
+            num_workers=0,
+            generator=g  # ✅ 绑定随机数生成器，确保 shuffle 可复现
         )
 
         print(f" 增强数据集设置完成")
         print(f"   数据集大小: {len(self.enhanced_dataset)}")
         print(f"   批次数量: {len(self.dataloader)}")
+        print(f"   随机种子: {self.seed} (DataLoader shuffle 已绑定)")
         print(f"   权重策略: {self.weighting_strategy}")
         if self.weighting_strategy == 'threshold':
             print(f"   过滤阈值: {self.weight_threshold}")
@@ -468,139 +508,172 @@ class WeightedContrastiveTrainer:
             print(f"   策略说明: 分层离散权重 - [0,0.4)→0.0(负例), [0.4,0.6)→0.5, [0.6,0.8)→0.7, [0.8,1.0]→0.9")
 
     def _load_pretrained_model(self):
-        """加载预训练的对比学习模型"""
+        """加载预训练的对比学习模型或从ModelScope模型初始化"""
         print(f" 加载预训练模型: {self.pretrained_model_path}")
 
-        if not os.path.exists(self.pretrained_model_path):
-            raise FileNotFoundError(f"预训练模型不存在: {self.pretrained_model_path}")
+        # ✅ 判断是本地文件还是ModelScope模型名称
+        is_local_checkpoint = os.path.exists(self.pretrained_model_path) and self.pretrained_model_path.endswith('.pth')
 
-        # 加载检查点
-        checkpoint = torch.load(self.pretrained_model_path, map_location='cpu', weights_only=False)
+        if is_local_checkpoint:
+            # ========== 情况1: 加载本地检查点（累积训练模式） ==========
+            print(" [模式] 从本地检查点加载（累积训练）")
+            checkpoint = torch.load(self.pretrained_model_path, map_location='cpu', weights_only=False)
 
-        # 获取模型配置
-        model_type = checkpoint.get('training_model_type', 'modelscope')
-        model_identifier = checkpoint.get('training_model_identifier_or_path')
-        proj_config = checkpoint.get('projection_head_config', {
-            'hidden_dim': 768, 'output_dim': 384, 'dropout_rate': 0.15
-        })
+            # 获取模型配置
+            model_type = checkpoint.get('training_model_type', 'modelscope')
+            model_identifier = checkpoint.get('training_model_identifier_or_path')
+            proj_config = checkpoint.get('projection_head_config', {
+                'hidden_dim': 768, 'output_dim': 384, 'dropout_rate': 0.15
+            })
 
-        # 重建对比学习编码器
-        self.contrastive_encoder = ContrastiveEncoder(
-            model_type=model_type,
-            model_name_or_path=model_identifier,
-            projection_hidden_dim=proj_config['hidden_dim'],
-            projection_output_dim=proj_config['output_dim'],
-            projection_dropout_rate=proj_config['dropout_rate']
-        )
+            # 重建对比学习编码器
+            self.contrastive_encoder = ContrastiveEncoder(
+                model_type=model_type,
+                model_name_or_path=model_identifier,
+                projection_hidden_dim=proj_config['hidden_dim'],
+                projection_output_dim=proj_config['output_dim'],
+                projection_dropout_rate=proj_config['dropout_rate']
+            )
 
-        #  重新初始化投影头（用于微调）
-        print(" 重新初始化投影头用于微调...")
-        for layer in self.contrastive_encoder.projection_head:
-            if hasattr(layer, 'weight') and layer.weight is not None:
-                # 只对2维或更高维的权重矩阵应用xavier初始化
-                if layer.weight.dim() >= 2:
-                    torch.nn.init.xavier_uniform_(layer.weight)
-                else:
-                    # 对于1维权重（如某些特殊层），使用正态分布初始化
-                    torch.nn.init.normal_(layer.weight, mean=0.0, std=0.02)
-            if hasattr(layer, 'bias') and layer.bias is not None:
-                torch.nn.init.zeros_(layer.bias)
+            #  重新初始化投影头（用于微调）
+            print(" 重新初始化投影头用于微调...")
+            for layer in self.contrastive_encoder.projection_head:
+                if hasattr(layer, 'weight') and layer.weight is not None:
+                    if layer.weight.dim() >= 2:
+                        torch.nn.init.xavier_uniform_(layer.weight)
+                    else:
+                        torch.nn.init.normal_(layer.weight, mean=0.0, std=0.02)
+                if hasattr(layer, 'bias') and layer.bias is not None:
+                    torch.nn.init.zeros_(layer.bias)
 
-        #  关键修正：参考sup_training.py的成功逻辑，先应用LoRA再加载权重
-        # 1. 首先检查checkpoint是否包含PEFT配置
-        use_peft_from_checkpoint = checkpoint.get('use_peft', False)
-        peft_config_from_checkpoint = checkpoint.get('peft_config', None)
+            #  关键修正：参考sup_training.py的成功逻辑，先应用LoRA再加载权重
+            # 1. 首先检查checkpoint是否包含PEFT配置
+            use_peft_from_checkpoint = checkpoint.get('use_peft', False)
+            peft_config_from_checkpoint = checkpoint.get('peft_config', None)
 
-        if use_peft_from_checkpoint and peft_config_from_checkpoint is not None:
-            print(" 检测到checkpoint包含PEFT/LoRA配置，先应用LoRA结构...")
+            if use_peft_from_checkpoint and peft_config_from_checkpoint is not None:
+                print(" 检测到checkpoint包含PEFT/LoRA配置，先应用LoRA结构...")
+                try:
+                    from peft import LoraConfig, get_peft_model
+
+                    # 使用checkpoint中的PEFT配置
+                    lora_config = LoraConfig(**peft_config_from_checkpoint)
+                    self.contrastive_encoder.base_model = get_peft_model(
+                        self.contrastive_encoder.base_model, lora_config
+                    )
+                    print(" LoRA结构已应用")
+
+                except Exception as e:
+                    print(f" LoRA结构应用失败: {e}")
+
+            # 2. 然后加载权重（现在结构应该匹配了）
             try:
-                from peft import LoraConfig, get_peft_model
+                missing_keys, unexpected_keys = self.contrastive_encoder.load_state_dict(
+                    checkpoint['contrastive_encoder_state_dict'], strict=False
+                )
+                print(f" 模型权重加载完成 (missing: {len(missing_keys)}, unexpected: {len(unexpected_keys)})")
 
-                # 使用checkpoint中的PEFT配置
-                lora_config = LoraConfig(**peft_config_from_checkpoint)
+                if use_peft_from_checkpoint:
+                    print(" 预训练模型LoRA权重已成功加载")
+
+            except Exception as e:
+                print(f" 权重加载部分失败: {e}")
+
+            # 3. 检查是否需要额外的PEFT配置（用于可能的新参数）
+            if self.use_peft:
+                self._apply_peft_if_needed()
+
+        else:
+            # ========== 情况2: 从ModelScope模型名称初始化（固定原始BERT模式） ==========
+            print(f" [模式] 从ModelScope模型初始化（固定原始BERT基座）")
+            print(f"   模型名称: {self.pretrained_model_path}")
+
+            # 使用默认的投影头配置（与Stage 1一致）
+            proj_config = {
+                'hidden_dim': 768,
+                'output_dim': 384,
+                'dropout_rate': 0.15
+            }
+
+            # 使用ModelScope加载模型
+            self.contrastive_encoder = ContrastiveEncoder(
+                model_type='modelscope',  # 使用modelscope类型
+                model_name_or_path=self.pretrained_model_path,
+                projection_hidden_dim=proj_config['hidden_dim'],
+                projection_output_dim=proj_config['output_dim'],
+                projection_dropout_rate=proj_config['dropout_rate']
+            )
+
+            print(" 从ModelScope成功初始化，投影头随机初始化")
+
+            # ✨ 从ModelScope初始化时，直接应用PEFT（如果需要）
+            if self.use_peft:
+                print(" 应用PEFT/LoRA到新初始化的模型...")
+                self._apply_peft_if_needed()
+
+        # 移动到设备
+        self.contrastive_encoder.to(self.device)
+
+    def _apply_peft_if_needed(self):
+        """应用PEFT配置（如果启用且尚未应用）"""
+        if not self.use_peft:
+            return
+
+        try:
+            from peft import PeftModel, LoraConfig, get_peft_model
+
+            if not hasattr(self.contrastive_encoder, 'base_model'):
+                print("    未找到base_model属性")
+                self.use_peft = False
+                return
+
+            base_model = self.contrastive_encoder.base_model
+
+            if isinstance(base_model, PeftModel):
+                print(" 确认模型已包含LoRA适配器")
+
+                # 获取当前LoRA配置信息
+                current_config = base_model.peft_config
+                if hasattr(current_config, 'values'):
+                    config_info = list(current_config.values())[0] if current_config else None
+                else:
+                    config_info = current_config.get('default', None) if hasattr(current_config, 'get') else current_config
+
+                if config_info:
+                    print(f"    LoRA配置: r={getattr(config_info, 'r', 'unknown')}, "
+                          f"alpha={getattr(config_info, 'lora_alpha', 'unknown')}, "
+                          f"target_modules={getattr(config_info, 'target_modules', 'unknown')}")
+                    print("    预训练模型LoRA权重成功继承")
+
+            else:
+                print("    模型不是PeftModel，应用新的LoRA配置...")
+
+                lora_config = LoraConfig(
+                    r=self.peft_config['r'],
+                    lora_alpha=self.peft_config['lora_alpha'],
+                    target_modules=self.peft_config['target_modules'],
+                    lora_dropout=self.peft_config['lora_dropout'],
+                    bias=self.peft_config['bias'],
+                    task_type="FEATURE_EXTRACTION"
+                )
+
                 self.contrastive_encoder.base_model = get_peft_model(
                     self.contrastive_encoder.base_model, lora_config
                 )
-                print(" LoRA结构已应用")
+                print("    新LoRA配置已应用")
 
-            except Exception as e:
-                print(f" LoRA结构应用失败: {e}")
+            # 计算可训练参数统计
+            total_params = sum(p.numel() for p in self.contrastive_encoder.parameters())
+            trainable_params = sum(p.numel() for p in self.contrastive_encoder.parameters() if p.requires_grad)
 
-        # 2. 然后加载权重（现在结构应该匹配了）
-        try:
-            missing_keys, unexpected_keys = self.contrastive_encoder.load_state_dict(
-                checkpoint['contrastive_encoder_state_dict'], strict=False
-            )
-            print(f" 模型权重加载完成 (missing: {len(missing_keys)}, unexpected: {len(unexpected_keys)})")
+            print(f"    参数统计: 总参数={total_params:,}, 可训练参数={trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
 
-            if use_peft_from_checkpoint:
-                print(" 预训练模型LoRA权重已成功加载")
-
+        except ImportError:
+            print("    PEFT库未安装")
+            self.use_peft = False
         except Exception as e:
-            print(f" 权重加载部分失败: {e}")
-
-        # 3. 检查是否需要额外的PEFT配置（用于可能的新参数）
-        if self.use_peft:
-            try:
-                from peft import PeftModel
-
-                if hasattr(self.contrastive_encoder, 'base_model'):
-                    base_model = self.contrastive_encoder.base_model
-
-                    if isinstance(base_model, PeftModel):
-                        print(" 确认模型已包含LoRA适配器")
-
-                        # 获取当前LoRA配置信息
-                        current_config = base_model.peft_config
-                        if hasattr(current_config, 'values'):
-                            config_info = list(current_config.values())[0] if current_config else None
-                        else:
-                            config_info = current_config.get('default', None) if hasattr(current_config, 'get') else current_config
-
-                        if config_info:
-                            print(f"    LoRA配置: r={getattr(config_info, 'r', 'unknown')}, "
-                                  f"alpha={getattr(config_info, 'lora_alpha', 'unknown')}, "
-                                  f"target_modules={getattr(config_info, 'target_modules', 'unknown')}")
-                            print("    预训练模型LoRA权重成功继承")
-
-                    else:
-                        print("    模型不是PeftModel，可能需要重新应用LoRA")
-                        if not use_peft_from_checkpoint:
-                            print("    应用新的LoRA配置...")
-                            from peft import LoraConfig, get_peft_model
-
-                            lora_config = LoraConfig(
-                                r=self.peft_config['r'],
-                                lora_alpha=self.peft_config['lora_alpha'],
-                                target_modules=self.peft_config['target_modules'],
-                                lora_dropout=self.peft_config['lora_dropout'],
-                                bias=self.peft_config['bias'],
-                                task_type="FEATURE_EXTRACTION"
-                            )
-
-                            self.contrastive_encoder.base_model = get_peft_model(
-                                self.contrastive_encoder.base_model, lora_config
-                            )
-                            print("    新LoRA配置已应用")
-
-                    # 计算可训练参数统计
-                    total_params = sum(p.numel() for p in self.contrastive_encoder.parameters())
-                    trainable_params = sum(p.numel() for p in self.contrastive_encoder.parameters() if p.requires_grad)
-
-                    print(f"    参数统计: 总参数={total_params:,}, 可训练参数={trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-
-                else:
-                    print("    未找到base_model属性")
-                    self.use_peft = False
-
-            except ImportError:
-                print("    PEFT库未安装")
-                self.use_peft = False
-            except Exception as e:
-                print(f"    PEFT配置检查失败: {e}")
-                self.use_peft = False
-
-        self.contrastive_encoder.to(self.device)
+            print(f"    PEFT配置应用失败: {e}")
+            self.use_peft = False
 
     def _setup_optimizer_and_loss(self):
         """设置优化器和损失函数"""
@@ -742,7 +815,7 @@ class WeightedContrastiveTrainer:
         history_save_path = self.enhanced_dataset_path.replace('.pkl', f'_round{self.round_num}_history.pkl')
         self.enhanced_dataset.save_enhanced_dataset_with_training_history(history_save_path)
 
-    def _compute_enhanced_infonce_loss(self, anchor_emb, positive_emb, negative_emb, temperature=0.07):
+    def _compute_enhanced_infonce_loss(self, anchor_emb, positive_emb, negative_emb, temperature=None):
         """
         计算增强的InfoNCE损失，包含额外的负样本
 
@@ -750,12 +823,15 @@ class WeightedContrastiveTrainer:
             anchor_emb: 锚点嵌入 [batch_size, embed_dim]
             positive_emb: 正样本嵌入 [batch_size, embed_dim]
             negative_emb: 额外负样本嵌入 [num_negatives, embed_dim]
-            temperature: 温度参数
+            temperature: 温度参数，None时使用self.temperature
 
         Returns:
             loss: 每个样本的损失 [batch_size]
         """
         import torch.nn.functional as F
+
+        if temperature is None:
+            temperature = self.temperature  # 使用实例变量
 
         batch_size = anchor_emb.size(0)
         num_negatives = negative_emb.size(0)
@@ -788,20 +864,38 @@ class WeightedContrastiveTrainer:
 
         return loss
 
-    def _compute_inbatch_infonce_loss(self, anchor_emb, positive_emb, temperature=0.07):
-        """计算 in-batch InfoNCE 损失"""
+    def _compute_inbatch_infonce_loss(self, anchor_emb, positive_emb, temperature=None):
+        """
+        计算 in-batch InfoNCE 损失 - 支持双向/单向可配置
+
+        Args:
+            anchor_emb: 锚点嵌入 [batch_size, embed_dim]
+            positive_emb: 正样本嵌入 [batch_size, embed_dim]
+            temperature: 温度参数，None时使用self.temperature
+
+        Returns:
+            loss: 每个样本的损失 [batch_size]
+        """
         import torch.nn.functional as F
+
+        if temperature is None:
+            temperature = self.temperature  # 使用实例变量
 
         batch_size = anchor_emb.size(0)
 
-        # 计算相似度矩阵
-        sim_matrix = torch.matmul(anchor_emb, positive_emb.t()) / temperature
-
-        # 对角线元素是正样本
+        # 计算 anchor→positive 相似度矩阵
+        sim_matrix_ap = torch.matmul(anchor_emb, positive_emb.t()) / temperature
         labels = torch.arange(batch_size, device=anchor_emb.device)
+        loss_ap = F.cross_entropy(sim_matrix_ap, labels, reduction='none')
 
-        # 计算 InfoNCE 损失
-        loss = F.cross_entropy(sim_matrix, labels, reduction='none')
+        if self.bidirectional_loss:
+            # 双向: 同时计算 positive→anchor 方向
+            sim_matrix_pa = torch.matmul(positive_emb, anchor_emb.t()) / temperature
+            loss_pa = F.cross_entropy(sim_matrix_pa, labels, reduction='none')
+            loss = (loss_ap + loss_pa) / 2.0
+        else:
+            # 单向: 仅使用 anchor→positive 方向
+            loss = loss_ap
 
         return loss
 
@@ -835,15 +929,30 @@ class WeightedContrastiveTrainer:
         save_dir = f"iter_model/{param_name}"
         os.makedirs(save_dir, exist_ok=True)
 
-        #  关键修改：确保检查点格式与第一阶段完全兼容
-        # 从预训练模型中获取原始配置信息
-        pretrained_checkpoint = torch.load(self.pretrained_model_path, map_location='cpu', weights_only=False)
+        # ✅ 修复：判断是本地检查点还是ModelScope模型名称
+        is_local_checkpoint = os.path.exists(self.pretrained_model_path) and self.pretrained_model_path.endswith('.pth')
+
+        if is_local_checkpoint:
+            # 从本地检查点加载配置信息（累积训练模式）
+            pretrained_checkpoint = torch.load(self.pretrained_model_path, map_location='cpu', weights_only=False)
+        else:
+            # 从ModelScope模型名称创建默认配置（固定原始BERT模式）
+            pretrained_checkpoint = {
+                'training_model_type': 'modelscope',
+                'training_model_identifier_or_path': self.pretrained_model_path,
+                'projection_head_config': {
+                    'hidden_dim': 768,
+                    'output_dim': 384,
+                    'dropout_rate': 0.15
+                }
+            }
 
         # 保存模型检查点 - 兼容第一阶段格式
         checkpoint = {
             # ===== 核心模型状态 =====
             'contrastive_encoder_state_dict': self.contrastive_encoder.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),  #  新增：优化器状态
+            # ❌ 移除：不保存optimizer_state_dict（节省~730MB）
+            # 'optimizer_state_dict': self.optimizer.state_dict(),
             'epoch': epoch,
             'best_loss': loss,  #  修改：使用与第一阶段一致的键名
             'training_history': {'second_stage_training': True, 'weighted_contrastive_epoch': epoch},  #  兼容字段
@@ -888,6 +997,8 @@ class WeightedContrastiveTrainer:
             'projection_lr': self.projection_lr,
             'base_lr_initial': self.base_lr,  #  新增：与第一阶段格式兼容
             'projection_lr_initial': self.projection_lr,  #  新增：与第一阶段格式兼容
+            'temperature': self.temperature,  # 新增：保存温度系数
+            'bidirectional_loss': self.bidirectional_loss,  # 新增：保存双向损失设置
             'data_fraction': data_fraction,
             'timestamp': timestamp,
             'is_best': is_best,
@@ -919,7 +1030,7 @@ class EnhancedDataCollator:
     """增强数据集的数据整理器，用于 in-batch 负样本和额外负样本"""
 
     def __init__(self, negative_sample_pool: List = None, negative_sample_ratio: float = 0.5,
-                 use_filtered_negatives: bool = False):
+                 use_filtered_negatives: bool = False, seed: int = 42):
         """
         初始化数据整理器
 
@@ -927,10 +1038,15 @@ class EnhancedDataCollator:
             negative_sample_pool: 负样本池（被筛掉的低置信样本）
             negative_sample_ratio: 负样本采样比例
             use_filtered_negatives: 是否使用过滤的负样本
+            seed: 随机种子（确保负采样可复现）
         """
         self.negative_sample_pool = negative_sample_pool or []
         self.negative_sample_ratio = negative_sample_ratio
         self.use_filtered_negatives = use_filtered_negatives
+        self.seed = seed
+
+        # ✅ 创建独立的随机数生成器（避免全局状态干扰）
+        self.rng = random.Random(seed)
 
     def __call__(self, batch):
         """处理批次数据"""
@@ -965,9 +1081,7 @@ class EnhancedDataCollator:
         return batch_result
 
     def _sample_negative_texts(self, batch_size: int) -> List[str]:
-        """从负样本池中采样负例文本"""
-        import random
-
+        """从负样本池中采样负例文本（使用独立 RNG 确保可复现）"""
         if not self.negative_sample_pool:
             return []
 
@@ -978,13 +1092,14 @@ class EnhancedDataCollator:
         if num_negatives == 0:
             return []
 
-        # 随机采样负样本
-        sampled_negatives = random.sample(self.negative_sample_pool, num_negatives)
+        # ✅ 使用独立的随机数生成器
+        sampled_negatives = self.rng.sample(self.negative_sample_pool, num_negatives)
 
         # 随机选择使用anchor或positive作为负例（增加多样性）
         negative_texts = []
         for neg_sample in sampled_negatives:
-            if random.random() < 0.5:
+            # ✅ 使用独立的随机数生成器
+            if self.rng.random() < 0.5:
                 negative_texts.append(neg_sample['anchor_content'])
             else:
                 negative_texts.append(neg_sample['positive_content'])
@@ -1132,11 +1247,14 @@ def run_stage2_weighted_contrastive(config: dict, pretrained_path: str,
         trainer = WeightedContrastiveTrainer(
             enhanced_dataset_path=enhanced_dataset,
             pretrained_model_path=pretrained_path,
+            seed=config.get('seed', 42),  # ✅ 新增：从配置读取随机种子
             weighting_strategy=config.get('weighting_strategy', 'linear'),
             weight_threshold=config.get('weight_threshold', 0.3),
             batch_size=config.get('batch_size', 16),
             base_lr=float(config.get('base_lr', 5e-6)),
             projection_lr=float(config.get('projection_lr', 5e-5)),
+            temperature=config.get('temperature', 0.07),  # 温度系数
+            bidirectional_loss=config.get('bidirectional_loss', False),  # 双向损失控制
             use_peft=config.get('use_peft', True),
             peft_config={
                 'r': config.get('lora_r', 8),
@@ -1156,12 +1274,28 @@ def run_stage2_weighted_contrastive(config: dict, pretrained_path: str,
         def custom_save_model(epoch, loss, is_best=False):
             """自定义保存函数，直接保存到指定目录"""
             if is_best:
-                # 从预训练模型中获取原始配置信息
-                pretrained_checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+                # ✅ 修复：判断是本地检查点还是ModelScope模型名称
+                is_local_checkpoint = os.path.exists(pretrained_path) and pretrained_path.endswith('.pth')
+
+                if is_local_checkpoint:
+                    # 从本地检查点加载配置信息（累积训练模式）
+                    pretrained_checkpoint = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+                else:
+                    # 从ModelScope模型名称创建默认配置（固定原始BERT模式）
+                    pretrained_checkpoint = {
+                        'training_model_type': 'modelscope',
+                        'training_model_identifier_or_path': pretrained_path,
+                        'projection_head_config': {
+                            'hidden_dim': 768,
+                            'output_dim': 384,
+                            'dropout_rate': 0.15
+                        }
+                    }
 
                 checkpoint = {
                     'contrastive_encoder_state_dict': trainer.contrastive_encoder.state_dict(),
-                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    # ❌ 移除：不保存optimizer_state_dict（节省~730MB）
+                    # 'optimizer_state_dict': trainer.optimizer.state_dict(),
                     'epoch': epoch,
                     'best_loss': loss,
                     'training_history': {'second_stage_training': True, 'weighted_contrastive_epoch': epoch},

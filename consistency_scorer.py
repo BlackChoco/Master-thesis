@@ -400,7 +400,8 @@ class ConsistencyScorer:
     def score_dataset_pairs(self, dataset_path: str, method: str = 'confidence_weighted_dot_product',
                            max_pairs: Optional[int] = None, batch_size: int = 32,
                            save_enhanced_dataset: bool = True,
-                           noise_config: Optional[Dict] = None) -> Dict:
+                           noise_config: Optional[Dict] = None,
+                           config: Optional[Dict] = None) -> Dict:
         """
         为数据集中的所有正样本对计算一致性得分，并保存增强数据集
 
@@ -410,6 +411,7 @@ class ConsistencyScorer:
             max_pairs: 最大处理对数（用于测试）
             batch_size: 批处理大小
             save_enhanced_dataset: 是否保存增强的数据集
+            config: 数据集配置（用于重新构建 SimCSE -> comment-reply）
 
         Returns:
             包含一致性得分的字典
@@ -433,6 +435,260 @@ class ConsistencyScorer:
         else:
             # 普通数据集格式
             actual_samples = dataset
+
+        # ✅ 新增：检测 SimCSE 格式并重新构建 comment-reply 数据集
+        if actual_samples and len(actual_samples) > 0:
+            first_sample = actual_samples[0]
+            if isinstance(first_sample, dict) and first_sample.get('pair_type') == 'simcse_single_text':
+                print(f" ⚠️  检测到 SimCSE 格式数据集")
+                print(f"    Round 2+ 需要 comment-reply 对，正在查找预构建的数据集...")
+
+                # ✅ 方案1：优先查找预构建的 comment-reply 数据集
+                comment_reply_dataset_path = None
+
+                # 从 SimCSE 数据集路径推断 comment-reply 数据集路径
+                if dataset_path:
+                    # 例如输入：autodl-tmp/experiment/.../round1/contrastive_training/dataset1_sim_0.0.pkl
+                    # 需要查找：cl_dataset/*_simcse_comment_reply_dataset.pkl
+
+                    dataset_dir = os.path.dirname(dataset_path)
+                    dataset_basename = os.path.basename(dataset_path)
+
+                    print(f"       原始数据集路径: {dataset_path}")
+                    print(f"       数据集目录: {dataset_dir}")
+                    print(f"       数据集文件名: {dataset_basename}")
+
+                    # ✅ 策略1：在实验目录同级查找（最可能的位置）
+                    import glob
+
+                    # 优先在数据集同目录查找comment-reply版本
+                    search_dirs = [
+                        dataset_dir,  # 数据集所在目录（最优先）
+                        'cl_dataset',  # 项目根目录（兼容旧版本）
+                        os.path.join(dataset_dir, '..', '..', 'cl_dataset'),  # 从 round/contrastive_training 向上2级
+                        os.path.join(dataset_dir, '..', '..', '..', 'cl_dataset'),  # 再向上1级
+                        os.path.join(dataset_dir, '..', '..', '..', '..', 'cl_dataset'),  # 再向上1级
+                    ]
+
+                    for search_dir in search_dirs:
+                        if not os.path.exists(search_dir):
+                            continue
+
+                        # 优先查找与当前数据集相似度阈值匹配的文件
+                        patterns = [
+                            os.path.join(search_dir, f'dataset1_comment_reply_sim_*.pkl'),  # 新格式
+                            os.path.join(search_dir, '*_simcse_comment_reply_dataset.pkl'),  # 旧格式
+                        ]
+
+                        for pattern in patterns:
+                            matches = glob.glob(pattern)
+
+                            if matches:
+                                # 按修改时间排序，使用最新的
+                                matches.sort(key=os.path.getmtime, reverse=True)
+                                comment_reply_dataset_path = matches[0]
+                                print(f"       ✅ 找到 comment-reply 数据集: {comment_reply_dataset_path}")
+                                break
+
+                        if comment_reply_dataset_path:
+                            break
+
+                    # ✅ 策略2：在实验目录同级查找（备用方案）
+                    if not comment_reply_dataset_path:
+                        possible_names = [
+                            dataset_basename.replace('dataset1_sim_', 'dataset1_comment_reply_sim_'),  # 新格式转换
+                            dataset_basename.replace('dataset1_', 'comment_reply_dataset1_'),  # 旧格式兼容
+                            dataset_basename.replace('.pkl', '_comment_reply.pkl'),
+                            'comment_reply_' + dataset_basename,
+                        ]
+
+                        for pattern in possible_names:
+                            candidate = os.path.join(dataset_dir, pattern)
+                            if os.path.exists(candidate):
+                                comment_reply_dataset_path = candidate
+                                print(f"       ✅ 在实验目录找到: {comment_reply_dataset_path}")
+                                break
+
+                # ✅ 如果找到了预构建的数据集，直接加载
+                if comment_reply_dataset_path and os.path.exists(comment_reply_dataset_path):
+                    print(f"    ✅ 找到预构建的 comment-reply 数据集: {comment_reply_dataset_path}")
+                    try:
+                        with open(comment_reply_dataset_path, 'rb') as f:
+                            comment_reply_dataset_obj = pickle.load(f)
+
+                        # 提取样本
+                        if hasattr(comment_reply_dataset_obj, '__len__') and hasattr(comment_reply_dataset_obj, '__getitem__'):
+                            actual_samples = [comment_reply_dataset_obj[i] for i in range(len(comment_reply_dataset_obj))]
+                            print(f"    ✅ 成功加载 {len(actual_samples)} 个 comment-reply 对")
+                        else:
+                            print(f"    ⚠️  数据集格式不兼容，将尝试重新构建")
+                            raise ValueError("数据集格式不兼容")
+
+                    except Exception as e:
+                        print(f"    ⚠️  加载预构建数据集失败: {e}")
+                        print(f"    将尝试重新构建...")
+                        comment_reply_dataset_path = None  # 标记为失败，继续重新构建
+
+                # ✅ 方案2：如果没有找到预构建数据集，重新构建
+                if not comment_reply_dataset_path:
+                    print(f"    未找到预构建的 comment-reply 数据集")
+
+                    if config is None:
+                        print(f"    ❌ 未提供 config 参数，无法重新构建")
+                        print(f"    将尝试使用 SimCSE 格式（可能导致 Round 2+ 性能下降）")
+                    else:
+                        print(f"    正在从原始数据重新构建...")
+
+                        # 从原始 CSV 重新构建 comment-reply 数据集
+                        from Tree_data_model import PostStorage
+                        import pandas as pd
+
+                        try:
+                            # 从配置获取数据路径
+                            comments_csv = config.get('cl_comments_data', 'data/cl_data/train_comments_filtered.csv')
+                            posts_csv = config.get('cl_posts_data', 'data/cl_data/train_posts_filtered.csv')
+
+                            print(f"       从原始数据: {comments_csv}")
+
+                            comment_df = pd.read_csv(comments_csv, encoding='utf-8')
+                            post_df = pd.read_csv(posts_csv, encoding='utf-8')
+
+                            # 构建 PostStorage
+                            comment_df['note_id'] = comment_df['note_id'].astype(str)
+                            comment_df['comment_id'] = comment_df['comment_id'].astype(str)
+                            comment_df['parent_comment_id'] = comment_df['parent_comment_id'].astype(str)
+                            post_df['note_id'] = post_df['note_id'].astype(str)
+
+                            storage = PostStorage()
+                            for _, row in post_df.iterrows():
+                                post_content = str(row.get('title', '')) or str(row.get('content', ''))
+                                storage.add_post(post_id=str(row['note_id']), post_content=post_content)
+
+                            for _, row in comment_df.iterrows():
+                                post_id_str = str(row['note_id'])
+                                comment_id_str = str(row['comment_id'])
+                                content_str = str(row.get('content', ''))
+                                parent_id_str = str(row['parent_comment_id']) if str(row['parent_comment_id']) != '0' else post_id_str
+
+                                try:
+                                    storage.add_comment_to_post(post_id_str, comment_id_str, content_str, parent_id_str)
+                                except Exception as e:
+                                    pass  # 忽略插入错误
+
+                            # 构建 comment-reply 数据集（使用顶部已导入的 ContrastiveDataset1）
+                            from cl_dataset import preprocess_text
+
+                            # 使用与 Round 1 相同的参数（从配置读取）
+                            similarity_threshold = config.get('similarity_threshold', 0.75)
+                            pruning_model_path = config.get('pruning_model_path', 'google-bert/bert-base-chinese')
+                            pruning_batch_size = config.get('pruning_inference_batch_size', 64)
+
+                            print(f"       步骤1: 计算剪枝嵌入（BERT）...")
+
+                            # 收集所有评论节点和文本
+                            comment_nodes_references = []
+                            all_comment_texts = []
+
+                            for post_id, post_tree in storage.posts.items():
+                                def collect_comments_from_node(node):
+                                    if node.content and isinstance(node.content, str):
+                                        comment_nodes_references.append(node)
+                                        all_comment_texts.append(node.content)
+                                    for child in node.children:
+                                        collect_comments_from_node(child)
+
+                                if post_tree.root:
+                                    collect_comments_from_node(post_tree.root)
+
+                            print(f"          找到 {len(all_comment_texts)} 条评论")
+
+                            # 预处理文本
+                            preprocessed_texts = [preprocess_text(text) for text in all_comment_texts]
+
+                            # 计算嵌入
+                            print(f"          加载BERT模型: {pruning_model_path}")
+                            from transformers import AutoModel, AutoTokenizer
+                            import torch
+
+                            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+                            # ✅ 添加离线模式设置
+                            print(f"          设置离线模式（使用本地缓存）...")
+                            os.environ['TRANSFORMERS_OFFLINE'] = '1'
+                            os.environ['HF_DATASETS_OFFLINE'] = '1'
+
+                            try:
+                                pruning_tokenizer = AutoTokenizer.from_pretrained(pruning_model_path, local_files_only=True)
+                                pruning_model = AutoModel.from_pretrained(pruning_model_path, local_files_only=True).to(device)
+                                pruning_model.eval()
+                            except Exception as e:
+                                print(f"          ❌ 离线加载失败: {e}")
+                                print(f"          尝试在线加载（可能较慢）...")
+                                # 移除离线模式限制
+                                os.environ.pop('TRANSFORMERS_OFFLINE', None)
+                                os.environ.pop('HF_DATASETS_OFFLINE', None)
+                                pruning_tokenizer = AutoTokenizer.from_pretrained(pruning_model_path)
+                                pruning_model = AutoModel.from_pretrained(pruning_model_path).to(device)
+                                pruning_model.eval()
+
+                            # 批量计算嵌入
+                            embeddings_list = []
+                            with torch.no_grad():
+                                for i in range(0, len(preprocessed_texts), pruning_batch_size):
+                                    batch_texts = preprocessed_texts[i:i + pruning_batch_size]
+                                    encodings = pruning_tokenizer(
+                                        batch_texts,
+                                        padding=True,
+                                        truncation=True,
+                                        return_tensors='pt',
+                                        max_length=256
+                                    ).to(device)
+
+                                    outputs = pruning_model(**encodings)
+                                    # 使用 [CLS] token 的嵌入
+                                    batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                                    embeddings_list.append(batch_embeddings)
+
+                            embeddings_np = np.vstack(embeddings_list)
+
+                            # 释放模型内存
+                            del pruning_model
+                            del pruning_tokenizer
+                            torch.cuda.empty_cache()
+
+                            print(f"          嵌入计算完成，形状: {embeddings_np.shape}")
+
+                            # 为评论节点设置嵌入
+                            for i, comment_node in enumerate(comment_nodes_references):
+                                comment_node.set_embedding(embeddings_np[i])
+
+                            print(f"       步骤2: 构建剪枝森林（threshold={similarity_threshold}）...")
+
+                            # 执行剪枝
+                            storage.forests.clear()
+                            pruning_results = storage.prune_all_posts_by_similarity(
+                                similarity_threshold=similarity_threshold,
+                                show_progress=True
+                            )
+                            print(f"          剪枝完成: {len(pruning_results)} 个帖子")
+
+                            print(f"       步骤3: 构建 ContrastiveDataset1...")
+                            dataset1 = ContrastiveDataset1(
+                                post_storage=storage,
+                                similarity_threshold=similarity_threshold,
+                                min_subtree_size=config.get('min_subtree_size_ds1', 2),
+                                max_samples_per_post=config.get('max_samples_per_post_ds1', None)
+                            )
+
+                            # 替换 actual_samples（将 Dataset 转换为样本列表）
+                            actual_samples = [dataset1[i] for i in range(len(dataset1))]
+                            print(f"       ✅ 重新构建完成，得到 {len(actual_samples)} 个 comment-reply 对")
+
+                        except Exception as e:
+                            print(f"       ❌ 重新构建失败: {e}")
+                            print(f"       将尝试使用 SimCSE 格式（可能导致 Round 2+ 性能下降）")
+                            import traceback
+                            traceback.print_exc()
 
         # 提取所有正样本对
         pairs = []
@@ -463,7 +719,22 @@ class ConsistencyScorer:
                 sample = actual_samples[i]
 
             # 检查数据集结构，适配不同的键名
-            if isinstance(dataset, ContrastiveDataset1):
+            # 通过样本结构判断数据集类型，而不是检查类型
+            # Dataset1 特征：有 anchor_content/anchor_text 和 positive_text_ds1/positive_text
+            is_dataset1 = False
+            is_dataset2 = False
+
+            # 检查样本键名以判断数据集类型
+            sample_keys = list(sample.keys()) if isinstance(sample, dict) else []
+
+            # Dataset1 的特征键
+            if any(key in sample_keys for key in ['positive_text_ds1', 'anchor_content', 'anchor_text']):
+                is_dataset1 = True
+            # Dataset2 的特征键
+            elif any(key in sample_keys for key in ['positive_content_lists_ds2', 'positive_content_lists']):
+                is_dataset2 = True
+
+            if is_dataset1:
                 # Dataset1: 父评论-子评论对
                 # 检查可能的键名变体
                 anchor_text = None
@@ -496,7 +767,7 @@ class ConsistencyScorer:
                         'positive_text': positive_text[:100] + '...' if len(positive_text) > 100 else positive_text,
                     })
 
-            elif isinstance(dataset, ContrastiveDataset2):
+            elif is_dataset2:
                 # Dataset2: 节点-子树中心对
                 anchor_text = None
                 positive_content_list = None
@@ -537,11 +808,28 @@ class ConsistencyScorer:
                     print(f"   调试：未知数据集类型，样本键名: {list(sample.keys())}")
                     print(f"   调试：样本类型: {type(sample)}")
 
+                # ✅ 检查是否是 SimCSE 格式（单文本）
+                pair_type = sample.get('pair_type', '')
+                if pair_type == 'simcse_single_text' or 'content' in sample:
+                    # SimCSE 格式：同一个文本作为 anchor 和 positive
+                    text = sample.get('content', '')
+                    if text:
+                        pairs.append((text, text))  # anchor 和 positive 相同（通过 dropout 区分）
+                        pair_info.append({
+                            'dataset_type': 'simcse',
+                            'sample_index': i,
+                            'anchor_text': text[:100] + '...' if len(text) > 100 else text,
+                            'positive_text': '(same as anchor - SimCSE dropout)',
+                            'pair_type': pair_type
+                        })
+                    continue  # ✅ 跳过后续的 anchor/positive 查找
+
                 # 尝试通用键名
                 anchor_text = None
                 positive_text = None
 
-                for anchor_key in ['anchor_content', 'anchor_text', 'anchor_texts', 'anchor', 'text', 'input_text']:
+                # ✅ 添加 'content' 支持（SimCSE数据集格式）
+                for anchor_key in ['anchor_content', 'anchor_text', 'anchor_texts', 'anchor', 'text', 'input_text', 'content']:
                     if anchor_key in sample:
                         anchor_text = sample[anchor_key]
                         break
@@ -1526,7 +1814,8 @@ def run_consistency_scoring_interface(classifier_path: str, dataset_path: str,
             max_pairs=config.get('max_pairs', None),
             batch_size=config.get('batch_size', 32),
             save_enhanced_dataset=config.get('save_enhanced_dataset', True),
-            noise_config=config.get('noise_injection')
+            noise_config=config.get('noise_injection'),
+            config=config  # ✅ 传递完整配置，用于 SimCSE -> comment-reply 重建
         )
 
         # 保存结果

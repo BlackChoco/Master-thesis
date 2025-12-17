@@ -77,34 +77,45 @@ class ExperimentStatusDetector:
         Returns:
             (是否完成, 模型路径)
         """
-        # 检查当前轮次的contrastive_training目录
+        # Round 2+ 的模型保存在 round_dir/best_model.pth（不在contrastive_training子目录）
+        model_candidates = []
+
+        # 优先级1：round_dir/best_model.pth（Round 2+的标准位置）
+        best_model_path = os.path.join(self.round_dir, 'best_model.pth')
+        if os.path.exists(best_model_path):
+            model_candidates.append(best_model_path)
+
+        # 优先级2：兼容contrastive_training子目录（如果存在）
         contrastive_dir = os.path.join(self.round_dir, "contrastive_training")
+        if os.path.exists(contrastive_dir):
+            for file in os.listdir(contrastive_dir):
+                if file.endswith('.pth') and 'best' in file.lower():
+                    model_candidates.append(os.path.join(contrastive_dir, file))
 
-        if not os.path.exists(contrastive_dir):
-            return False, None
+        # 检查每个候选模型
+        for model_path in model_candidates:
+            try:
+                checkpoint = self._load_checkpoint(model_path)
 
-        # 查找Stage2模型文件
-        for file in os.listdir(contrastive_dir):
-            if file.endswith('.pth') and 'best' in file.lower():
-                model_path = os.path.join(contrastive_dir, file)
+                # 检查Stage2标记
+                if checkpoint.get('training_stage') == 'weighted_contrastive':
+                    print(f"  [OK] 找到Stage2模型: {model_path}")
+                    return True, model_path
 
-                # 验证是否是Stage2模型
-                try:
-                    checkpoint = self._load_checkpoint(model_path)
+                # 检查training_history中的second_stage标记
+                if checkpoint.get('training_history', {}).get('second_stage_training', False):
+                    print(f"  [OK] 找到Stage2模型: {model_path}")
+                    return True, model_path
 
-                    # 检查Stage2标记
-                    if checkpoint.get('training_stage') == 'weighted_contrastive':
-                        print(f"  [OK] 找到Stage2模型: {model_path}")
-                        return True, model_path
+                # 对于Round 2+，如果是best_model.pth且round_num > 1，也认为是Stage2模型
+                if self.round_num > 1 and os.path.basename(model_path) == 'best_model.pth':
+                    # 额外检查：确认不是Stage1模型（Stage1使用best_contrastive_model.pth）
+                    print(f"  [OK] 找到Stage2模型 (Round {self.round_num}): {model_path}")
+                    return True, model_path
 
-                    # 检查training_history中的second_stage标记
-                    if checkpoint.get('training_history', {}).get('second_stage_training', False):
-                        print(f"  [OK] 找到Stage2模型: {model_path}")
-                        return True, model_path
-
-                except Exception as e:
-                    print(f"  [警告] 无法加载模型 {model_path}: {e}")
-                    continue
+            except Exception as e:
+                print(f"  [警告] 无法加载模型 {model_path}: {e}")
+                continue
 
         return False, None
 
@@ -611,8 +622,32 @@ def print_experiment_status(output_dir: str, target_round: int):
     for round_num in range(1, target_round + 1):
         print(f"\nRound {round_num}:")
         detector = ExperimentStatusDetector(output_dir, round_num)
-        summary = detector.get_round_status_summary()
 
+        # 显示具体的检测结果，包括找到的文件
+        if round_num == 1:
+            stage1_done, encoder_path = detector.detect_stage1_contrastive_status()
+            if stage1_done and encoder_path:
+                print(f"  [OK] 找到Stage1模型: {os.path.relpath(encoder_path, output_dir)}")
+            else:
+                print(f"  [未完成] stage1_contrastive")
+        else:
+            stage2_done, encoder_path = detector.detect_stage2_contrastive_status()
+            if stage2_done and encoder_path:
+                # 已经在detect_stage2_contrastive_status中打印了
+                pass
+            else:
+                print(f"  [未完成] stage2_contrastive (加权对比学习)")
+
+        # 监督学习状态
+        sup_done, sup_path = detector.detect_supervised_learning_status()
+        # 监督学习的状态已经在detect_supervised_learning_status中打印
+
+        # 一致性评分状态
+        cons_done, cons_path = detector.detect_consistency_scoring_status()
+        # 一致性评分的状态已经在detect_consistency_scoring_status中打印
+
+        # 获取并显示状态摘要
+        summary = detector.get_round_status_summary()
         for stage, completed in summary.items():
             symbol = '[完成]' if completed else '[未完成]'
             print(f"  {symbol} {stage}")
